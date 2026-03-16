@@ -226,7 +226,43 @@ impl eframe::App for App {
 
         // --- Main panel ---
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(15.0);
+            ui.add_space(10.0);
+
+            // --- VPN ad (top) ---
+            ui.vertical_centered(|ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(25, 30, 42))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(14, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(100, 180, 255),
+                                egui::RichText::new("by sonic VPN").size(13.0).strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new("Полный обход для всех приложений")
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(160, 165, 180)),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("@bysonicvpn_bot")
+                                            .size(12.0)
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(100, 200, 255)),
+                                    )
+                                    .frame(false),
+                                ).clicked() {
+                                    let _ = open::that("https://t.me/bysonicvpn_bot");
+                                }
+                            });
+                        });
+                    });
+            });
+
+            ui.add_space(12.0);
 
             ui.vertical_centered(|ui| {
                 if !running {
@@ -315,44 +351,6 @@ impl eframe::App for App {
                 "Не-Telegram трафик проходит напрямую без изменений",
             );
 
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(6.0);
-
-            // --- VPN ad ---
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(30, 35, 50))
-                .corner_radius(10.0)
-                .inner_margin(14.0)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(100, 180, 255),
-                            egui::RichText::new("by sonic VPN").size(16.0).strong(),
-                        );
-                        ui.label(egui::RichText::new(" — ").size(14.0));
-                        ui.label(
-                            egui::RichText::new("Полный обход блокировок для всех приложений")
-                                .size(13.0),
-                        );
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Быстрый VPN без ограничений скорости:");
-                        let link = ui.add(
-                            egui::Hyperlink::from_label_and_url(
-                                egui::RichText::new("@bysonicvpn_bot")
-                                    .size(14.0)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(100, 200, 255)),
-                                "https://t.me/bysonicvpn_bot",
-                            ),
-                        );
-                        if link.clicked() {
-                            let _ = open::that("https://t.me/bysonicvpn_bot");
-                        }
-                    });
-                });
         });
     }
 }
