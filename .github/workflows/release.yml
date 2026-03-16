@@ -1,0 +1,64 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tg_unblock-windows-x64
+          path: target/release/tg_unblock.exe
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tg_unblock-windows-x64
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tg_unblock.exe
+          generate_release_notes: true
+          body: |
+            ## TG Unblock ${{ github.ref_name }}
+
+            Обход блокировки Telegram через WebSocket-туннель.
+
+            ### Установка
+            1. Скачайте `tg_unblock.exe`
+            2. Запустите
+            3. Нажмите "Запустить обход"
+            4. Нажмите "Настроить автоматически"
+
+            ---
+            **[by sonic VPN](https://t.me/bysonicvpn_bot)** — полный обход блокировок для всех приложений
