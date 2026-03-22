@@ -3,28 +3,51 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 pub fn detect_adapter() -> Option<String> {
+    // TODO: Add a menu to let the user choose the network adapter manually
+    // instead of automatically picking one.
+    let script = r#"
+        $adapters = Get-NetAdapter | Where-Object Status -eq 'Up'
+
+        $candidates = foreach ($adapter in $adapters) {
+            $config = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue
+            if ($config.IPv4DefaultGateway -or $config.IPv6DefaultGateway) {
+                $goodIpv4 = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                    Where-Object { $_.IPAddress -notmatch '^169\.254\.' } |
+                    Select-Object -First 1
+
+                [PSCustomObject]@{
+                    Adapter = $adapter
+                    Score   = if ($goodIpv4) { 2 } else { 1 }
+                }
+            }
+        }
+
+        if ($candidates) {
+            ($candidates | Sort-Object Score -Descending | Select-Object -First 1).Adapter.Name
+        } else {
+            $adapters[0].Name
+        }
+    "#;
+
     let output = Command::new("powershell")
-        .args([
-            "-Command",
-            "(Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -First 1).Name",
-        ])
+        .args(["-Command", script])
         .output()
         .ok()?;
 
     let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    if name.is_empty() { None } else { Some(name) }
 }
 
 pub fn get_current_dns() -> Option<String> {
+    let script = r#"
+        Get-DnsClientServerAddress -AddressFamily IPv4 |
+            Where-Object { $_.ServerAddresses.Count -gt 0 } |
+            Select-Object -First 1 -ExpandProperty ServerAddresses |
+            Out-String
+    "#;
+
     let output = Command::new("powershell")
-        .args([
-            "-Command",
-            "Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {$_.ServerAddresses.Count -gt 0} | Select-Object -First 1 -ExpandProperty ServerAddresses | Out-String",
-        ])
+        .args(["-Command", script])
         .output()
         .ok()?;
 
