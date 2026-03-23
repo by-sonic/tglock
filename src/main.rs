@@ -35,7 +35,7 @@ fn setup_fonts(ctx: &egui::Context) {
     fonts.font_data.insert(
         "system".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
-            "C:\\Windows\\Fonts\\segoeui.ttf"
+            "../fonts/IBMPlexSans-Regular.ttf"
         ))),
     );
     fonts
@@ -78,7 +78,11 @@ impl App {
         };
         log_msg(&app.log, "Запущено", false);
         if !is_admin {
-            log_msg(&app.log, "Нет прав администратора — DNS менять не получится", true);
+            log_msg(
+                &app.log,
+                "Нет прав администратора — DNS менять не получится",
+                true,
+            );
         }
         {
             let adapter = app.adapter_name.clone();
@@ -110,7 +114,11 @@ impl App {
         std::thread::spawn(move || {
             // DNS
             if is_admin {
-                let aname = adapter.lock().unwrap().clone().or_else(network::detect_adapter);
+                let aname = adapter
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .or_else(network::detect_adapter);
                 if let Some(ref name) = aname {
                     if bypass::set_dns(name, "1.1.1.1", "1.0.0.1").is_ok() {
                         bypass::flush_dns();
@@ -120,7 +128,11 @@ impl App {
                 }
             }
 
-            log_msg(&log, &format!("Запускаю WS-прокси на 127.0.0.1:{}...", PROXY_PORT), false);
+            log_msg(
+                &log,
+                &format!("Запускаю WS-прокси на 127.0.0.1:{}...", PROXY_PORT),
+                false,
+            );
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             let result = rt.block_on(ws_proxy::run_proxy(PROXY_PORT, stats));
@@ -144,7 +156,11 @@ impl App {
             let log = self.log.clone();
             let dns_set = self.dns_set.clone();
             std::thread::spawn(move || {
-                let aname = adapter.lock().unwrap().clone().or_else(network::detect_adapter);
+                let aname = adapter
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .or_else(network::detect_adapter);
                 if let Some(ref name) = aname {
                     let _ = bypass::reset_dns(name);
                     bypass::flush_dns();
@@ -167,7 +183,12 @@ fn log_msg(log: &Arc<Mutex<Vec<LogEntry>>>, text: &str, err: bool) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let ts = format!("{:02}:{:02}:{:02}", (now % 86400) / 3600, (now % 3600) / 60, now % 60);
+    let ts = format!(
+        "{:02}:{:02}:{:02}",
+        (now % 86400) / 3600,
+        (now % 3600) / 60,
+        now % 60
+    );
     log.lock().unwrap().push(LogEntry {
         text: text.to_string(),
         is_error: err,
@@ -195,7 +216,10 @@ impl eframe::App for App {
                         egui::RichText::new("ПРОКСИ РАБОТАЕТ").strong(),
                     );
                     ui.separator();
-                    ui.label(format!("Соединений: {} (WS: {}) | Всего: {}", active, ws, total));
+                    ui.label(format!(
+                        "Соединений: {} (WS: {}) | Всего: {}",
+                        active, ws, total
+                    ));
                 } else {
                     ui.label("Прокси не запущен");
                 }
@@ -245,19 +269,25 @@ impl eframe::App for App {
                                     .size(12.0)
                                     .color(egui::Color32::from_rgb(160, 165, 180)),
                             );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.add(
-                                    egui::Button::new(
-                                        egui::RichText::new("@bysonicvpn_bot")
-                                            .size(12.0)
-                                            .strong()
-                                            .color(egui::Color32::from_rgb(100, 200, 255)),
-                                    )
-                                    .frame(false),
-                                ).clicked() {
-                                    let _ = open::that("https://t.me/bysonicvpn_bot");
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("@bysonicvpn_bot")
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(100, 200, 255)),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        let _ = open::that("https://t.me/bysonicvpn_bot");
+                                    }
+                                },
+                            );
                         });
                     });
             });
@@ -266,14 +296,19 @@ impl eframe::App for App {
 
             ui.vertical_centered(|ui| {
                 if !running {
-                    ui.label(egui::RichText::new("Обход блокировки Telegram через WebSocket-прокси").size(15.0));
+                    ui.label(
+                        egui::RichText::new("Обход блокировки Telegram через WebSocket-прокси")
+                            .size(15.0),
+                    );
                     ui.add_space(5.0);
                     ui.label("Трафик идёт через web.telegram.org — провайдер видит обычный HTTPS");
                     ui.add_space(15.0);
 
                     let btn = ui.add_sized(
                         [340.0, 55.0],
-                        egui::Button::new(egui::RichText::new("Запустить обход").size(20.0).strong()),
+                        egui::Button::new(
+                            egui::RichText::new("Запустить обход").size(20.0).strong(),
+                        ),
                     );
                     if btn.clicked() {
                         self.start_proxy();
@@ -285,7 +320,10 @@ impl eframe::App for App {
                     );
                     ui.add_space(5.0);
                     ui.label(format!("SOCKS5 прокси на 127.0.0.1:{}", PROXY_PORT));
-                    ui.label(format!("WebSocket-туннелей: {} | Соединений: {}", ws, active));
+                    ui.label(format!(
+                        "WebSocket-туннелей: {} | Соединений: {}",
+                        ws, active
+                    ));
                     ui.add_space(12.0);
 
                     // Stop button
@@ -350,7 +388,6 @@ impl eframe::App for App {
                 egui::Color32::from_rgb(170, 170, 170),
                 "Не-Telegram трафик проходит напрямую без изменений",
             );
-
         });
     }
 }
