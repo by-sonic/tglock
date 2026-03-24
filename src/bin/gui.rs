@@ -1,13 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod bypass;
-mod network;
-mod ws_proxy;
-
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
+use tg_unblock::{bypass, network, ws_proxy};
 
 const PROXY_PORT: u16 = 1080;
 
@@ -30,6 +27,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+#[cfg(target_os = "windows")]
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -50,6 +48,9 @@ fn setup_fonts(ctx: &egui::Context) {
         .insert(0, "system".to_owned());
     ctx.set_fonts(fonts);
 }
+
+#[cfg(not(target_os = "windows"))]
+fn setup_fonts(_ctx: &egui::Context) {}
 
 #[derive(Clone)]
 struct LogEntry {
