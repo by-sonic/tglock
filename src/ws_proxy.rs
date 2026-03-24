@@ -11,6 +11,7 @@ pub struct ProxyStats {
     pub active_conn: AtomicU32,
     pub total_conn: AtomicU32,
     pub ws_active: AtomicU32,
+    pub verbose: AtomicBool,
 }
 
 impl ProxyStats {
@@ -20,12 +21,17 @@ impl ProxyStats {
             active_conn: AtomicU32::new(0),
             total_conn: AtomicU32::new(0),
             ws_active: AtomicU32::new(0),
+            verbose: AtomicBool::new(false),
         })
     }
 }
 
 pub async fn run_proxy(port: u16, stats: Arc<ProxyStats>) -> Result<(), String> {
-    let addr = format!("127.0.0.1:{}", port);
+    run_proxy_bind("127.0.0.1", port, stats).await
+}
+
+pub async fn run_proxy_bind(bind: &str, port: u16, stats: Arc<ProxyStats>) -> Result<(), String> {
+    let addr = format!("{}:{}", bind, port);
     let listener = TcpListener::bind(&addr)
         .await
         .map_err(|e| format!("Не удалось занять порт {}: {}", port, e))?;
@@ -143,7 +149,7 @@ async fn handle_socks5(
 
     let (dest_addr, dest_port) = parse_dest(&buf[3..n])?;
     let is_tg = is_telegram_ip(&dest_addr);
-
+    let verbose = stats.verbose.load(Ordering::Relaxed);
     // SOCKS5 success (we handle the connection ourselves)
     stream
         .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x04, 0x38])
@@ -163,6 +169,10 @@ async fn handle_socks5(
                 .unwrap_or(2)
         });
 
+        if verbose {
+            eprintln!("[+] Telegram {}:{} -> WSS DC{}", dest_addr, dest_port, dc);
+        }
+
         stats.ws_active.fetch_add(1, Ordering::Relaxed);
 
         // Try WebSocket tunnel; fall back to direct TCP on failure
@@ -170,12 +180,19 @@ async fn handle_socks5(
 
         stats.ws_active.fetch_sub(1, Ordering::Relaxed);
 
+        if verbose {
+            eprintln!("[-] Telegram DC{} отключён", dc);
+        }
+
         if let Err(e) = ws_result {
             return Err(format!("DC{} tunnel: {}", dc, e).into());
         }
     } else {
         // Non-Telegram — direct TCP passthrough
         let target = format!("{}:{}", dest_addr, dest_port);
+        if verbose {
+            eprintln!("[+] TCP {}:{}", dest_addr, dest_port);
+        }
         match TcpStream::connect(&target).await {
             Ok(remote) => {
                 let _ = remote.set_nodelay(true);
