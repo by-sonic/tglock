@@ -3,24 +3,37 @@ name = "tg_unblock"
 version = "0.3.1"
 edition = "2021"
 
+[lib]
+name = "tg_unblock"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tg_unblock"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "tg_unblock_gui"
+path = "src/bin/gui.rs"
+required-features = ["gui"]
+
+[features]
+gui = ["dep:eframe", "dep:egui", "dep:open"]
+
 [dependencies]
-eframe = "0.31"
-egui = "0.31"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["blocking"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-open = "5"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 native-tls = "0.2"
 futures-util = "0.3"
 aes = "0.8"
 ctr = "0.9"
 cipher = "0.4"
+clap = { version = "4", features = ["derive"] }
+
+# GUI (optional)
+eframe = { version = "0.31", optional = true }
+egui = { version = "0.31", optional = true }
+open = { version = "5", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winuser"] }
-
-[[bin]]
-name = "tg_unblock"
-path = "src/main.rs"
