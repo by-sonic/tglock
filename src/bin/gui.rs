@@ -1,13 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod bypass;
-mod network;
-mod ws_proxy;
-
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
+use tg_unblock::{bypass, network, ws_proxy};
 
 const PROXY_PORT: u16 = 1080;
 
@@ -30,6 +27,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+#[cfg(target_os = "windows")]
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -50,6 +48,9 @@ fn setup_fonts(ctx: &egui::Context) {
         .insert(0, "system".to_owned());
     ctx.set_fonts(fonts);
 }
+
+#[cfg(not(target_os = "windows"))]
+fn setup_fonts(_ctx: &egui::Context) {}
 
 #[derive(Clone)]
 struct LogEntry {
@@ -123,7 +124,7 @@ impl App {
             log_msg(&log, &format!("Запускаю WS-прокси на 127.0.0.1:{}...", PROXY_PORT), false);
 
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(ws_proxy::run_proxy(PROXY_PORT, stats));
+            let result = rt.block_on(ws_proxy::run_proxy_bind("127.0.0.1", PROXY_PORT, stats));
             if let Err(e) = result {
                 log_msg(&log, &format!("Прокси остановлен: {}", e), true);
             }
@@ -163,11 +164,7 @@ impl App {
 }
 
 fn log_msg(log: &Arc<Mutex<Vec<LogEntry>>>, text: &str, err: bool) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let ts = format!("{:02}:{:02}:{:02}", (now % 86400) / 3600, (now % 3600) / 60, now % 60);
+    let ts = chrono::Local::now().format("%H:%M:%S").to_string();
     log.lock().unwrap().push(LogEntry {
         text: text.to_string(),
         is_error: err,

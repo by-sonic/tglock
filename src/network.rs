@@ -2,6 +2,9 @@ use std::net::{TcpStream, SocketAddr};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+// ===== Adapter detection =====
+
+#[cfg(target_os = "windows")]
 pub fn detect_adapter() -> Option<String> {
     let output = Command::new("powershell")
         .args([
@@ -19,6 +22,28 @@ pub fn detect_adapter() -> Option<String> {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+pub fn detect_adapter() -> Option<String> {
+    // Parse default route: "default via 10.0.0.1 dev eth0 ..."
+    let output = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(pos) = line.find("dev ") {
+            let after = &line[pos + 4..];
+            let iface = after.split_whitespace().next()?;
+            return Some(iface.to_string());
+        }
+    }
+    None
+}
+
+// ===== Current DNS =====
+
+#[cfg(target_os = "windows")]
 pub fn get_current_dns() -> Option<String> {
     let output = Command::new("powershell")
         .args([
@@ -36,20 +61,56 @@ pub fn get_current_dns() -> Option<String> {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+pub fn get_current_dns() -> Option<String> {
+    let content = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    let servers: Vec<&str> = content
+        .lines()
+        .filter(|l| l.starts_with("nameserver"))
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .collect();
+
+    if servers.is_empty() {
+        Some("Не определено".to_string())
+    } else {
+        Some(servers.join(", "))
+    }
+}
+
+// ===== Ping =====
+
+#[cfg(target_os = "windows")]
 pub fn ping_host(ip: &str) -> (bool, Option<u64>) {
     let start = Instant::now();
     let output = Command::new("ping")
         .args(["-n", "1", "-w", "3000", ip])
         .output();
 
+    parse_ping_output(output, start)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn ping_host(ip: &str) -> (bool, Option<u64>) {
+    let start = Instant::now();
+    let output = Command::new("ping")
+        .args(["-c", "1", "-W", "3", ip])
+        .output();
+
+    parse_ping_output(output, start)
+}
+
+fn parse_ping_output(
+    output: Result<std::process::Output, std::io::Error>,
+    start: Instant,
+) -> (bool, Option<u64>) {
     match output {
         Ok(out) => {
             let elapsed = start.elapsed().as_millis() as u64;
             let stdout = String::from_utf8_lossy(&out.stdout);
-            let ok = out.status.success() && (stdout.contains("TTL=") || stdout.contains("ttl="));
+            let ok = out.status.success()
+                && (stdout.contains("TTL=") || stdout.contains("ttl="));
 
             if ok {
-                // Try to extract actual time from ping output
                 if let Some(time_str) = extract_ping_time(&stdout) {
                     (true, Some(time_str))
                 } else {
@@ -64,7 +125,6 @@ pub fn ping_host(ip: &str) -> (bool, Option<u64>) {
 }
 
 fn extract_ping_time(output: &str) -> Option<u64> {
-    // Match patterns like "time=46ms" or "time<1ms" or "время=46мс"
     for line in output.lines() {
         let lower = line.to_lowercase();
         if let Some(pos) = lower.find("time=").or_else(|| lower.find("time<")) {
@@ -88,8 +148,13 @@ fn extract_ping_time(output: &str) -> Option<u64> {
     None
 }
 
+// ===== TCP / HTTPS checks (cross-platform) =====
+
 pub fn tcp_check(ip: &str, port: u16) -> (bool, Option<u64>) {
-    let addr: SocketAddr = format!("{}:{}", ip, port).parse().unwrap();
+    let addr: SocketAddr = match format!("{}:{}", ip, port).parse() {
+        Ok(a) => a,
+        Err(_) => return (false, None),
+    };
     let start = Instant::now();
     match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
         Ok(_stream) => {
@@ -119,9 +184,6 @@ pub fn https_check(url: &str) -> (bool, Option<u64>) {
     }
 }
 
-/// Benchmarks Telegram connectivity: runs multiple TCP+HTTPS checks,
-/// returns (works: bool, score: u64) where lower score = faster connection.
-/// Score is average latency across all successful checks. u64::MAX if nothing works.
 pub fn benchmark_telegram() -> (bool, u64) {
     let tcp_targets = [
         ("149.154.167.51", 443u16),
@@ -134,7 +196,6 @@ pub fn benchmark_telegram() -> (bool, u64) {
     let mut ok_count: u64 = 0;
     let mut fail_count: u64 = 0;
 
-    // TCP checks (x2 rounds for stability)
     for _ in 0..2 {
         for (ip, port) in &tcp_targets {
             let (ok, latency) = tcp_check(ip, *port);
@@ -147,7 +208,6 @@ pub fn benchmark_telegram() -> (bool, u64) {
         }
     }
 
-    // HTTPS check — the real indicator of usable speed
     let https_urls = [
         "https://web.telegram.org",
         "https://t.me",
@@ -155,7 +215,6 @@ pub fn benchmark_telegram() -> (bool, u64) {
     for url in &https_urls {
         let (ok, latency) = https_check(url);
         if ok {
-            // Weight HTTPS 3x heavier since it's closer to real usage
             let ms = latency.unwrap_or(10000);
             total_ms += ms * 3;
             ok_count += 3;
@@ -168,7 +227,6 @@ pub fn benchmark_telegram() -> (bool, u64) {
         return (false, u64::MAX);
     }
 
-    // Penalize failures: each fail adds 2000ms to the score
     let penalty = fail_count * 2000;
     let avg = (total_ms + penalty) / (ok_count + fail_count);
 

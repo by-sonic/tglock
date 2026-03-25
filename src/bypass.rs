@@ -1,6 +1,8 @@
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// ===== Admin/root check =====
+
+#[cfg(target_os = "windows")]
 pub fn check_admin() -> bool {
     let output = Command::new("net")
         .args(["session"])
@@ -8,6 +10,21 @@ pub fn check_admin() -> bool {
     matches!(output, Ok(o) if o.status.success())
 }
 
+#[cfg(not(target_os = "windows"))]
+pub fn check_admin() -> bool {
+    let output = Command::new("id").args(["-u"]).output();
+    match output {
+        Ok(o) => {
+            let uid = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            uid == "0"
+        }
+        Err(_) => false,
+    }
+}
+
+// ===== DNS management =====
+
+#[cfg(target_os = "windows")]
 pub fn set_dns(adapter: &str, primary: &str, secondary: &str) -> Result<(), String> {
     let out1 = Command::new("netsh")
         .args([
@@ -37,6 +54,31 @@ pub fn set_dns(adapter: &str, primary: &str, secondary: &str) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
+pub fn set_dns(interface: &str, primary: &str, secondary: &str) -> Result<(), String> {
+    // Try resolvectl first (systemd-resolved)
+    if has_command("resolvectl") {
+        let out = Command::new("resolvectl")
+            .args(["dns", interface, primary, secondary])
+            .output()
+            .map_err(|e| format!("resolvectl error: {}", e))?;
+
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("resolvectl failed: {}", stderr));
+    }
+
+    // Fallback: write /etc/resolv.conf directly
+    backup_resolv_conf()?;
+    let content = format!("# Set by tg_unblock\nnameserver {}\nnameserver {}\n", primary, secondary);
+    std::fs::write("/etc/resolv.conf", content)
+        .map_err(|e| format!("Failed to write /etc/resolv.conf: {}", e))?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 pub fn reset_dns(adapter: &str) -> Result<(), String> {
     let out = Command::new("netsh")
         .args([
@@ -53,12 +95,82 @@ pub fn reset_dns(adapter: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
+pub fn reset_dns(interface: &str) -> Result<(), String> {
+    if has_command("resolvectl") {
+        let out = Command::new("resolvectl")
+            .args(["revert", interface])
+            .output()
+            .map_err(|e| format!("resolvectl error: {}", e))?;
+
+        if out.status.success() {
+            return Ok(());
+        }
+    }
+
+    // Fallback: restore backup
+    restore_resolv_conf()
+}
+
+#[cfg(target_os = "windows")]
 pub fn flush_dns() {
     let _ = Command::new("ipconfig")
         .args(["/flushdns"])
         .output();
 }
 
+#[cfg(not(target_os = "windows"))]
+pub fn flush_dns() {
+    if has_command("resolvectl") {
+        let _ = Command::new("resolvectl")
+            .args(["flush-caches"])
+            .output();
+    }
+}
+
+// ===== Linux helpers =====
+
+#[cfg(not(target_os = "windows"))]
+fn has_command(name: &str) -> bool {
+    Command::new("which")
+        .arg(name)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn backup_resolv_conf() -> Result<(), String> {
+    let backup = "/etc/resolv.conf.tg_unblock_bak";
+    if !std::path::Path::new(backup).exists() {
+        std::fs::copy("/etc/resolv.conf", backup)
+            .map_err(|e| format!("Failed to backup resolv.conf: {}", e))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn restore_resolv_conf() -> Result<(), String> {
+    let backup = "/etc/resolv.conf.tg_unblock_bak";
+    if std::path::Path::new(backup).exists() {
+        std::fs::copy(backup, "/etc/resolv.conf")
+            .map_err(|e| format!("Failed to restore resolv.conf: {}", e))?;
+        // Only remove backup after successful restore
+        if let Err(e) = std::fs::remove_file(backup) {
+            eprintln!("Warning: could not remove backup file: {}", e);
+        }
+        Ok(())
+    } else {
+        Err("No resolv.conf backup found".to_string())
+    }
+}
+
+// ===== Windows-only: GoodbyeDPI =====
+
+#[cfg(target_os = "windows")]
+use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "windows")]
 pub fn find_goodbyedpi() -> Option<String> {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -75,7 +187,6 @@ pub fn find_goodbyedpi() -> Option<String> {
     ];
 
     for dir in &search_dirs {
-        // Check common locations
         for sub in &["x86_64", "x86", ""] {
             let candidate = if sub.is_empty() {
                 dir.join("goodbyedpi.exe")
@@ -88,7 +199,6 @@ pub fn find_goodbyedpi() -> Option<String> {
         }
     }
 
-    // Recursive search in tools/
     if let Ok(entries) = find_file_recursive(Path::new("tools"), "goodbyedpi.exe") {
         if !entries.is_empty() {
             return Some(entries[0].to_string_lossy().to_string());
@@ -98,6 +208,7 @@ pub fn find_goodbyedpi() -> Option<String> {
     None
 }
 
+#[cfg(target_os = "windows")]
 fn find_file_recursive(dir: &Path, filename: &str) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut results = Vec::new();
     if !dir.exists() {
@@ -115,6 +226,7 @@ fn find_file_recursive(dir: &Path, filename: &str) -> Result<Vec<PathBuf>, std::
     Ok(results)
 }
 
+#[cfg(target_os = "windows")]
 pub fn get_blacklist_path() -> Option<String> {
     let candidates = vec![
         PathBuf::from("tg_blacklist.txt"),
@@ -133,6 +245,7 @@ pub fn get_blacklist_path() -> Option<String> {
     None
 }
 
+#[cfg(target_os = "windows")]
 pub fn start_goodbyedpi(exe_path: &str, args: &[&str], blacklist: Option<&str>) -> Result<(), String> {
     let mut cmd = Command::new(exe_path);
     cmd.args(args);
@@ -145,12 +258,14 @@ pub fn start_goodbyedpi(exe_path: &str, args: &[&str], blacklist: Option<&str>) 
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
 pub fn kill_goodbyedpi() {
     let _ = Command::new("taskkill")
         .args(["/f", "/im", "goodbyedpi.exe"])
         .output();
 }
 
+#[cfg(target_os = "windows")]
 pub fn download_goodbyedpi() -> Result<String, String> {
     let tools_dir = PathBuf::from("tools");
     std::fs::create_dir_all(&tools_dir)
@@ -159,7 +274,6 @@ pub fn download_goodbyedpi() -> Result<String, String> {
     let zip_path = tools_dir.join("goodbyedpi.zip");
     let url = "https://github.com/ValdikSS/GoodbyeDPI/releases/download/0.2.3rc3/goodbyedpi-0.2.3rc3-2.zip";
 
-    // Download using powershell
     let dl_script = format!(
         "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing",
         url,
@@ -176,7 +290,6 @@ pub fn download_goodbyedpi() -> Result<String, String> {
         return Err(format!("Download failed: {}", stderr));
     }
 
-    // Extract
     let extract_script = format!(
         "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
         zip_path.to_string_lossy(),
@@ -193,9 +306,7 @@ pub fn download_goodbyedpi() -> Result<String, String> {
         return Err(format!("Extraction failed: {}", stderr));
     }
 
-    // Clean up zip
     let _ = std::fs::remove_file(&zip_path);
 
-    // Find the exe
     find_goodbyedpi().ok_or_else(|| "goodbyedpi.exe not found after extraction".to_string())
 }
