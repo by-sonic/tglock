@@ -1,4 +1,5 @@
 use std::sync::atomic::Ordering;
+use std::net::IpAddr;
 
 use clap::Parser;
 use tg_unblock::{bypass, network, ws_proxy};
@@ -21,6 +22,12 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
+
+    // Validate bind address early
+    if args.bind.parse::<IpAddr>().is_err() {
+        eprintln!("[!] Неверный адрес привязки: {}", args.bind);
+        std::process::exit(1);
+    }
 
     let is_admin = bypass::check_admin();
     let mut dns_was_set = false;
