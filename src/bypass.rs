@@ -155,7 +155,10 @@ fn restore_resolv_conf() -> Result<(), String> {
     if std::path::Path::new(backup).exists() {
         std::fs::copy(backup, "/etc/resolv.conf")
             .map_err(|e| format!("Failed to restore resolv.conf: {}", e))?;
-        let _ = std::fs::remove_file(backup);
+        // Only remove backup after successful restore
+        if let Err(e) = std::fs::remove_file(backup) {
+            eprintln!("Warning: could not remove backup file: {}", e);
+        }
         Ok(())
     } else {
         Err("No resolv.conf backup found".to_string())

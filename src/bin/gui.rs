@@ -124,7 +124,7 @@ impl App {
             log_msg(&log, &format!("Запускаю WS-прокси на 127.0.0.1:{}...", PROXY_PORT), false);
 
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(ws_proxy::run_proxy(PROXY_PORT, stats));
+            let result = rt.block_on(ws_proxy::run_proxy_bind("127.0.0.1", PROXY_PORT, stats));
             if let Err(e) = result {
                 log_msg(&log, &format!("Прокси остановлен: {}", e), true);
             }

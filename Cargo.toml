@@ -24,11 +24,13 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["blocking"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 native-tls = "0.2"
+tokio-native-tls = "0.3"
 futures-util = "0.3"
 aes = "0.8"
 ctr = "0.9"
 cipher = "0.4"
 clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
 
 # GUI (optional)
 eframe = { version = "0.31", optional = true }

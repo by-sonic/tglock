@@ -16,7 +16,7 @@ struct Args {
 
     /// Сменить DNS на Cloudflare 1.1.1.1 (нужен root/admin)
     #[arg(long)]
-    dns: bool,
+    dns: bool
 }
 
 fn main() {
