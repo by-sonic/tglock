@@ -151,7 +151,10 @@ fn extract_ping_time(output: &str) -> Option<u64> {
 // ===== TCP / HTTPS checks (cross-platform) =====
 
 pub fn tcp_check(ip: &str, port: u16) -> (bool, Option<u64>) {
-    let addr: SocketAddr = format!("{}:{}", ip, port).parse().unwrap();
+    let addr: SocketAddr = match format!("{}:{}", ip, port).parse() {
+        Ok(a) => a,
+        Err(_) => return (false, None),
+    };
     let start = Instant::now();
     match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
         Ok(_stream) => {
