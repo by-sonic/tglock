@@ -164,11 +164,7 @@ impl App {
 }
 
 fn log_msg(log: &Arc<Mutex<Vec<LogEntry>>>, text: &str, err: bool) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let ts = format!("{:02}:{:02}:{:02}", (now % 86400) / 3600, (now % 3600) / 60, now % 60);
+    let ts = chrono::Local::now().format("%H:%M:%S").to_string();
     log.lock().unwrap().push(LogEntry {
         text: text.to_string(),
         is_error: err,
