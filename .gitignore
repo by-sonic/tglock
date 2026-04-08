@@ -1,6 +1,5 @@
 /target
 /tools
-*.zip
-*.exe
-!*.rs
 Cargo.lock
+*.zip
+.claude/

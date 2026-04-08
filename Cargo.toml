@@ -1,26 +1,22 @@
 [package]
-name = "tg_unblock"
-version = "0.3.1"
+name = "tglock"
+version = "1.0.0"
 edition = "2021"
+description = "Telegram unblock via local WebSocket tunnel"
+license = "MIT"
 
 [dependencies]
 eframe = "0.31"
 egui = "0.31"
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["blocking"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-open = "5"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 native-tls = "0.2"
 futures-util = "0.3"
 aes = "0.8"
 ctr = "0.9"
 cipher = "0.4"
-
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winuser"] }
+open = "5"
 
 [[bin]]
-name = "tg_unblock"
+name = "tglock"
 path = "src/main.rs"

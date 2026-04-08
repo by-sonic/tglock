@@ -1,64 +1,83 @@
-name: Build & Release
+name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
 
 permissions:
   contents: write
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: tglock.exe
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: tglock-macos-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: tglock-macos-arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: tglock-linux-x64
+
+    runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          targets: ${{ matrix.target }}
 
-      - name: Build release
-        run: cargo build --release
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Upload artifact
+      - name: Rename (Unix)
+        if: runner.os != 'Windows'
+        run: cp target/${{ matrix.target }}/release/tglock ${{ matrix.artifact }}
+
+      - name: Rename (Windows)
+        if: runner.os == 'Windows'
+        run: copy target\${{ matrix.target }}\release\tglock.exe ${{ matrix.artifact }}
+
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: tg_unblock-windows-x64
-          path: target/release/tg_unblock.exe
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
 
   release:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Download artifact
+      - name: Download artifacts
         uses: actions/download-artifact@v4
-        with:
-          name: tg_unblock-windows-x64
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: tg_unblock.exe
           generate_release_notes: true
+          files: |
+            tglock.exe/tglock.exe
+            tglock-macos-x64/tglock-macos-x64
+            tglock-macos-arm64/tglock-macos-arm64
+            tglock-linux-x64/tglock-linux-x64
           body: |
-            ## TG Unblock ${{ github.ref_name }}
+            ## TGLock ${{ github.ref_name }}
 
-            Обход блокировки Telegram через WebSocket-туннель.
+            Обход блокировки Telegram через WebSocket-туннель. Один клик.
 
-            ### Установка
-            1. Скачайте `tg_unblock.exe`
-            2. Запустите
-            3. Нажмите "Запустить обход"
-            4. Нажмите "Настроить автоматически"
+            | Файл | Платформа |
+            |---|---|
+            | `tglock.exe` | Windows x64 |
+            | `tglock-macos-x64` | macOS Intel |
+            | `tglock-macos-arm64` | macOS Apple Silicon |
+            | `tglock-linux-x64` | Linux x64 |
 
-            ---
             **[by sonic VPN](https://t.me/bysonicvpn_bot)** — полный обход блокировок для всех приложений
