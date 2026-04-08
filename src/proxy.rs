@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite;
 use tungstenite::client::IntoClientRequest;
 
-pub const PORT: u16 = 1080;
+pub const DEFAULT_PORT: u16 = 1080;
 
 pub struct Stats {
     pub running: AtomicBool,
@@ -29,12 +29,12 @@ impl Stats {
     }
 }
 
-pub async fn run(stats: Arc<Stats>, lan: bool) -> Result<(), String> {
+pub async fn run(stats: Arc<Stats>, lan: bool, port: u16) -> Result<(), String> {
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
-    let addr = format!("{}:{}", host, PORT);
+    let addr = format!("{}:{}", host, port);
     let listener = TcpListener::bind(&addr)
         .await
-        .map_err(|e| format!("Port {} busy: {}", PORT, e))?;
+        .map_err(|e| format!("Port {} busy: {}", port, e))?;
 
     stats.running.store(true, Ordering::SeqCst);
 

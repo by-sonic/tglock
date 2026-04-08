@@ -94,6 +94,8 @@ struct App {
     log: Arc<Mutex<Vec<LogLine>>>,
     started_at: Option<Instant>,
     lan_mode: bool,
+    port_str: String,
+    active_port: u16,
 }
 
 impl App {
@@ -103,6 +105,8 @@ impl App {
             log: Arc::new(Mutex::new(Vec::new())),
             started_at: None,
             lan_mode: false,
+            port_str: proxy::DEFAULT_PORT.to_string(),
+            active_port: proxy::DEFAULT_PORT,
         }
     }
 
@@ -112,6 +116,16 @@ impl App {
 
     fn start(&mut self) {
         if self.running() { return; }
+
+        let port: u16 = match self.port_str.trim().parse() {
+            Ok(p) if p > 0 => p,
+            _ => {
+                log(&self.log, "Неверный порт", true);
+                return;
+            }
+        };
+
+        self.active_port = port;
         self.started_at = Some(Instant::now());
         let stats = self.stats.clone();
         let lg = self.log.clone();
@@ -121,7 +135,7 @@ impl App {
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let r = rt.block_on(proxy::run(stats, lan));
+            let r = rt.block_on(proxy::run(stats, lan, port));
             if let Err(e) = r {
                 log(&lg, &format!("Ошибка: {}", e), true);
             }
@@ -130,7 +144,7 @@ impl App {
         std::thread::sleep(std::time::Duration::from_millis(250));
         if self.running() {
             let addr = if lan { "0.0.0.0" } else { "127.0.0.1" };
-            log(&self.log, &format!("SOCKS5 на {}:{}", addr, proxy::PORT), false);
+            log(&self.log, &format!("SOCKS5 на {}:{}", addr, port), false);
             if lan {
                 log(&self.log, "LAN-режим: другие устройства могут подключаться", false);
             }
@@ -257,16 +271,22 @@ impl eframe::App for App {
 
                 ui.add_space(20.0);
 
-                // LAN toggle (only when stopped)
+                // Options (only when stopped)
                 if !on {
                     ui.horizontal(|ui| {
-                        let center = ui.available_width() / 2.0 - 90.0;
+                        let center = ui.available_width() / 2.0 - 130.0;
                         ui.add_space(center);
+                        ui.colored_label(TEXT2, egui::RichText::new("Порт:").size(12.0));
+                        let port_edit = egui::TextEdit::singleline(&mut self.port_str)
+                            .desired_width(55.0)
+                            .font(egui::TextStyle::Monospace);
+                        ui.add(port_edit);
+                        ui.add_space(12.0);
                         ui.checkbox(&mut self.lan_mode, "");
-                        ui.colored_label(TEXT2, egui::RichText::new("Локальная сеть").size(12.0));
+                        ui.colored_label(TEXT2, egui::RichText::new("LAN").size(12.0));
                         ui.colored_label(
                             egui::Color32::from_rgb(80, 85, 95),
-                            egui::RichText::new("(0.0.0.0 — для всех устройств)").size(10.5),
+                            egui::RichText::new("(0.0.0.0)").size(10.5),
                         );
                     });
                     ui.add_space(8.0);
@@ -314,11 +334,15 @@ impl eframe::App for App {
                             "127.0.0.1".into()
                         };
 
+                        let display_port = if on { self.active_port } else {
+                            self.port_str.trim().parse().unwrap_or(proxy::DEFAULT_PORT)
+                        };
+
                         if on {
                             if ui.add(egui::Button::new(
                                 egui::RichText::new("Настроить автоматически").size(13.0).color(ACCENT)
                             ).frame(false)).clicked() {
-                                let _ = open::that(format!("tg://socks?server={}&port={}", server_addr, proxy::PORT));
+                                let _ = open::that(format!("tg://socks?server={}&port={}", server_addr, display_port));
                                 log(&self.log, "Открываю настройку Telegram...", false);
                             }
                             ui.add_space(4.0);
@@ -332,7 +356,7 @@ impl eframe::App for App {
                             ui.monospace(&server_addr);
                             ui.end_row();
                             ui.colored_label(TEXT2, "Порт");
-                            ui.monospace(format!("{}", proxy::PORT));
+                            ui.monospace(format!("{}", display_port));
                             ui.end_row();
                         });
                     });
