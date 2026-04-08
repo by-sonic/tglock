@@ -1,86 +1,40 @@
-# Написал обход блокировки Telegram на Rust за 300 строк — без VPN, серверов и абонентки
+# TGLock v2: переписал обход Telegram с нуля — теперь работает на маке, и один прокси на всю квартиру
 
-**Простой · 6 мин · Rust · Open source · Сетевые технологии · Из песочницы**
+**Простой · 7 мин · Rust · Open source · macOS · Сетевые технологии**
 
-**TL;DR:** Open-source приложение **TGLock** на Rust. Один клик — Telegram работает. Локальный SOCKS5-прокси заворачивает MTProto в WebSocket через `web.telegram.org`. Провайдер видит HTTPS. Windows, macOS, Linux. 300 строк кода. GitHub — [by-sonic/tglock](https://github.com/by-sonic/tglock).
+**TL;DR:** Полмесяца назад я выложил TGLock — обход блокировки Telegram через WebSocket-туннель. Статья залетела на 183K просмотров. А потом всё сломалось. Соединения рвались через 2 минуты, DC определялся неправильно, маководы плакали в комментах. Переписал с нуля. 350 строк. Работает на macOS, Windows, Linux. Один прокси — все устройства в квартире. Код: [github.com/by-sonic/tglock](https://github.com/by-sonic/tglock).
 
 ---
 
-## Почему GoodbyeDPI больше не хватает
+## Что случилось после первой статьи
 
-GoodbyeDPI, Zapret — отличные инструменты. Они фрагментируют пакеты, ломают сигнатуры DPI, и это работало. До определённого момента.
+Первая версия TGLock делала простую вещь: SOCKS5-прокси заворачивал MTProto в WebSocket через `web.telegram.org`. Провайдер видит HTTPS — Telegram работает. Концепция правильная. Реализация — нет.
 
-Проблема: провайдеры перешли от DPI к **IP-шейпингу**. Весь трафик к подсетям Telegram (149.154.x.x, 91.108.x.x) режется по скорости. Неважно, видит DPI MTProto или нет — если destination IP принадлежит Telegram, соединение троттлится.
+Через неделю после релиза прилетело:
 
-Результат: GoodbyeDPI запущен, пакеты фрагментированы, DPI обманут — а Telegram всё равно грузится 10 секунд, медиа не приходят, звонки рвутся. Пинг 200+, постоянные переподключения.
+> «Работает 2 минуты, потом Telegram пишет ошибку прокси»
 
-VPN решает, но:
-- Стоит денег
-- Гонит **весь** трафик через чужой сервер
-- Для одного Telegram — оверкилл
+> «По умолчанию выбирает неправильное сетевое подключение, вешается на VMware-адаптер»
 
-Нужен другой подход.
+> «Порт 1080 занят, как поменять?»
 
-## Идея: WebSocket через web.telegram.org
+> «А на маке будет?»
 
-Замерил: прямое TCP-соединение к серверам Telegram (149.154.167.51:443) — таймаут или 200+ мс. А вот `web.telegram.org` отвечает стабильно за 50–80 мс. Логично: это «обычный сайт», провайдер его не трогает.
+Последний вопрос задавали чаще всего. GoodbyeDPI — только Windows. Zapret — есть tpws, но это терминал и ручная настройка. GUI для обхода Telegram на маке — **не существует**. Вообще.
 
-Полез в [документацию MTProto](https://core.telegram.org/mtproto/transports):
+Решил: не патчить старый код. Переписать с нуля.
 
-> **WebSocket:** Implementation of the WebSocket transport is **pretty much the same as with TCP**... all data received and sent through WebSocket messages is to be treated as a **single duplex stream of bytes**, just like with TCP.
+## Что было не так с v1
 
-Telegram официально поддерживает WebSocket-транспорт. Эндпоинты `kws1-5.web.telegram.org` — полноценные точки входа в сеть Telegram через WSS.
+### Обрыв через 2 минуты
 
-**Схема:**
+Главный баг. WebSocket-серверы Telegram (`kws*.web.telegram.org`) шлют **Ping-фреймы** каждые ~60 секунд. Если клиент не отвечает Pong — сервер закрывает соединение.
 
-```
-Telegram Desktop → SOCKS5 → TGLock → WSS (kws{dc}.web.telegram.org) → DC
-                                ↑
-                   Провайдер видит: HTTPS к web.telegram.org
-```
+В v1 я использовал `split()` из `futures` чтобы разделить WebSocket-стрим на два потока — чтение и запись. Красиво, идиоматично, по учебнику. И сломано.
 
-Нет MTProto в трафике. Нет подозрительных IP. Обычный HTTPS.
+Ping приходит в read-поток. Pong нужно отправить через write-поток. Между ними — channel или shared state. В теории работает. На практике — Pong опаздывает на десятки миллисекунд, сервер считает клиента мёртвым.
 
-## Реализация: 300 строк на Rust
-
-Весь проект — два файла: `proxy.rs` (туннель) и `main.rs` (UI).
-
-### SOCKS5 → определение DC → WebSocket
-
-Когда Telegram Desktop подключается через SOCKS5, мы:
-
-**1.** Обрабатываем SOCKS5-хендшейк и получаем destination IP.
-
-**2.** Читаем первые 64 байта — это obfuscated2 init-пакет MTProto. Из него извлекаем настоящий DC через AES-256-CTR:
-
-```rust
-fn dc_from_init(init: &[u8; 64]) -> Option<u8> {
-    use aes::Aes256;
-    use cipher::{KeyIvInit, StreamCipher};
-
-    let mut dec = *init;
-    let mut c = ctr::Ctr128BE::<Aes256>::new(
-        init[8..40].into(),
-        init[40..56].into(),
-    );
-    c.apply_keystream(&mut dec);
-
-    let id = i32::from_le_bytes([dec[60], dec[61], dec[62], dec[63]]);
-    let dc = id.unsigned_abs() as u8;
-    (1..=5).contains(&dc).then_some(dc)
-}
-```
-
-**3.** Открываем WebSocket к нужному DC с обязательным заголовком `Sec-WebSocket-Protocol: binary` и таймаутом 10 секунд:
-
-```rust
-let (mut ws, _) = tokio::time::timeout(
-    Duration::from_secs(10),
-    tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(tls)),
-).await??;
-```
-
-**4.** Отправляем буферизованные 64 байта init-пакета как первый WebSocket-фрейм. Дальше — двунаправленный relay в одном `tokio::select!` цикле:
+**Решение в v2:** один `tokio::select!` цикл, без split. WebSocket остаётся единым объектом. `biased` приоритизирует чтение WS — Pong улетает мгновенно:
 
 ```rust
 loop {
@@ -104,72 +58,232 @@ loop {
 }
 ```
 
-Ключевой момент — **Ping/Pong**. Без ответа на Ping сервер закрывает соединение через ~2 минуты. Первая версия это игнорировала — пользователи жаловались на обрывы.
+Обратите внимание на `flush()` после каждого write в TCP. Без него tokio буферизует данные, Telegram Desktop ждёт ответ, не дожидается, переподключается. Ещё один баг v1, который маскировался под «нестабильное соединение».
 
-### Не-Telegram трафик
+### Неправильный DC
 
-Если destination IP не принадлежит Telegram — прямой TCP passthrough. Прокси не трогает ничего лишнего.
+В v1 DC определялся по IP-адресу. Таблица маппинга из документации Telegram:
 
-## Стабильность: что ломалось и как починили
+```
+149.154.160-163 → DC1
+149.154.164-167 → DC2
+91.108.56-59    → DC5
+...
+```
 
-**Проблема 1: Обрыв через 2 минуты.**
-WebSocket-сервер отправляет Ping-фреймы. Первая реализация использовала `split()` и два отдельных потока — Ping приходил в `read`-поток, а Pong нужно было отправить через `write`-поток. Решение: единый `tokio::select!` цикл без split. `biased` приоритизирует WS-чтение — Pong улетает мгновенно.
+Проблема: в подсети `149.154.164-167` живут **и DC2, и DC4**. Telegram Desktop мог коннектиться к IP, который по таблице выглядит как DC2, а на самом деле хочет DC4. Прокси открывает WebSocket к `kws2.web.telegram.org`, отправляет данные — сервер дропает соединение. Пользователь видит «прокси не настроен».
 
-**Проблема 2: Неправильный DC.**
-IP-маппинг ненадёжен: в подсети 149.154.164-167 живут и DC2, и DC4. Если отправить данные не в тот DC — сервер дропает соединение. Решение: извлекать DC из obfuscated2 init через AES-256-CTR.
+**Решение в v2:** не угадывать DC по IP. Telegram Desktop использует **obfuscated2** транспорт. Первые 64 байта — зашифрованный init-пакет. Внутри — настоящий DC ID.
 
-**Проблема 3: Зависание на подключении.**
-Если `kws*.web.telegram.org` не отвечает — прокси висел бесконечно. Решение: `tokio::time::timeout(10s)` на WebSocket connect.
+Ключ: байты `[8..40]`, IV: `[40..56]`. Алгоритм: AES-256-CTR. DC ID: `i32` в байтах `[60..64]` расшифрованного пакета.
 
-**Проблема 4: Потеря данных.**
-TCP-write без `flush()` мог буферизовать данные. Telegram Desktop ожидал ответ, не получал его, переподключался. Решение: явный `flush()` после каждого write.
+```rust
+fn dc_from_init(init: &[u8; 64]) -> Option<u8> {
+    use aes::Aes256;
+    use cipher::{KeyIvInit, StreamCipher};
 
-## UI: egui, не Electron
+    let mut dec = *init;
+    let mut c = ctr::Ctr128BE::<Aes256>::new(
+        init[8..40].into(),
+        init[40..56].into(),
+    );
+    c.apply_keystream(&mut dec);
 
-Нативный GUI через egui. Тёмная тема, минимальный интерфейс. Бинарник ~6 МБ, без зависимостей.
+    let id = i32::from_le_bytes([dec[60], dec[61], dec[62], dec[63]]);
+    let dc = id.unsigned_abs() as u8;
+    (1..=5).contains(&dc).then_some(dc)
+}
+```
 
-Одна кнопка — ПОДКЛЮЧИТЬ/ОТКЛЮЧИТЬ. Статистика в реальном времени: активные соединения, WebSocket-туннели, текущий DC, аптайм.
+12 строк. Три крейта (`aes`, `ctr`, `cipher`). Зато DC определяется **точно**, а не «скорее всего».
 
-## Кроссплатформенность
+IP-маппинг остался как fallback — на случай если init-пакет повреждён (что на практике не случается).
 
-Ни одной строки платформо-специфичного кода. Работает на:
-- **Windows** x64
-- **macOS** Intel + Apple Silicon
-- **Linux** x64
+### Привязка к Windows
 
-CI/CD через GitHub Actions — при создании тега автоматически собираются бинарники для всех платформ.
+v1 использовала:
+- `netsh` для смены DNS
+- Хардкоженный путь к шрифтам Windows
+- `taskkill` для остановки процессов
+- `ipconfig /flushdns`
 
-## Сравнение
+Ни одна из этих вещей не нужна для WebSocket-прокси. DNS менять не надо — `web.telegram.org` резолвится нормально. Шрифты — egui использует встроенные. Весь платформо-специфичный код был мусором.
 
-| | GoodbyeDPI | Zapret | VPN | **TGLock** |
+**v2: 0 строк платформо-специфичного кода.** Один и тот же бинарник компилируется на Windows, macOS и Linux без единого `#[cfg(target_os)]`.
+
+## macOS: почему это важно
+
+Среди разработчиков, дизайнеров, людей из IT — процент маководов огромный. А инструментов для обхода блокировки Telegram на маке — ноль целых, ноль десятых.
+
+- **GoodbyeDPI** — Windows only. Даже не обсуждается.
+- **Zapret** — есть `tpws` для macOS, но это CLI. Нужно: `brew install`, `sudo`, правка конфигов, ручная настройка системного прокси через `networksetup`. Для техничных людей — ОК. Для остальных — нет.
+- **VPN** — работает, но гонит весь трафик. Для одного Telegram — оверкилл за $5/мес.
+
+TGLock v2: скачал бинарник, запустил, нажал кнопку. Всё. Никакого `brew`, никакого `sudo`, никаких конфигов.
+
+На Apple Silicon (M1–M4) — нативный ARM-бинарник, ~6 МБ. На Intel-маках — x86_64 билд. Оба собираются автоматически в GitHub Actions.
+
+### Gatekeeper
+
+Apple блокирует неподписанные приложения. Developer ID стоит $99/год. Для бесплатного open-source — не вариант. Решение стандартное:
+
+```bash
+xattr -cr ~/Downloads/tglock-macos-arm64
+chmod +x ~/Downloads/tglock-macos-arm64
+```
+
+Две команды, один раз.
+
+## LAN-режим: один прокси на всю квартиру
+
+Это была самая частая просьба в ишью:
+
+> «Цель: пустить все домашние устройства с Telegram через один такой прокси на компе в локальной сети»
+
+В v1 прокси слушал `127.0.0.1:1080` — только локально. Устройства в сети не могли подключиться.
+
+В v2 — чекбокс **LAN** в интерфейсе. Включаешь — прокси биндится на `0.0.0.0`. Все устройства в домашней сети могут использовать прокси.
+
+```
+Телефон  ──┐
+Планшет ───┤── SOCKS5 → 192.168.1.42:1080 ──► TGLock ──► WSS → DC
+Ноутбук ───┘
+```
+
+Приложение автоматически определяет LAN IP и показывает его в интерфейсе. На телефоне в настройках Telegram: SOCKS5, адрес — IP компьютера, порт — тот что в приложении.
+
+Один компьютер. Все устройства. Без VPN, без роутера, без конфигов.
+
+### Настраиваемый порт
+
+Ещё один ишью: «порт 1080 занят другим сервисом».
+
+Теперь порт можно менять прямо в интерфейсе. По умолчанию 1080, но если занят — ставишь любой другой. Порт валидируется при старте, в настройках Telegram автоматически отображается текущий.
+
+## Архитектура v2
+
+Два файла. 350 строк. Всё.
+
+### proxy.rs (~160 строк)
+
+```
+TcpListener (0.0.0.0 | 127.0.0.1 : port)
+      │
+      ▼
+  SOCKS5 handshake
+      │
+      ├── IP ∈ Telegram? ──► read 64-byte init
+      │                       │
+      │                       ▼
+      │                  dc_from_init (AES-256-CTR)
+      │                       │
+      │                       ▼
+      │                  WSS kws{dc}.web.telegram.org
+      │                       │
+      │                       ▼
+      │                  select! { ws ⟷ tcp }
+      │
+      └── IP ∉ Telegram? ──► direct TCP relay
+```
+
+Никаких абстракций, traits, generics. Прямолинейный async-код. Каждое соединение — один `tokio::spawn`, один `select!` цикл.
+
+### main.rs (~190 строк)
+
+GUI на egui. Тёмная тема (GitHub Dark). Статистика в реальном времени: активные соединения, WS-туннели, текущий DC, аптайм.
+
+Кнопка «Настроить автоматически» — открывает Telegram через `tg://socks?server=...&port=...`. Один клик до рабочего Telegram.
+
+## CI/CD: бинарники для всех
+
+GitHub Actions при пуше тега `v*` собирает:
+
+| Файл | Платформа |
+|---|---|
+| `tglock.exe` | Windows x64 |
+| `tglock-macos-arm64` | macOS Apple Silicon |
+| `tglock-macos-x64` | macOS Intel |
+| `tglock-linux-x64` | Linux x64 |
+
+Четыре платформы, один workflow, автоматические релизы. Скачал — запустил — работает.
+
+```yaml
+strategy:
+  matrix:
+    include:
+      - os: windows-latest
+        target: x86_64-pc-windows-msvc
+        artifact: tglock.exe
+      - os: macos-latest
+        target: aarch64-apple-darwin
+        artifact: tglock-macos-arm64
+      - os: macos-latest
+        target: x86_64-apple-darwin
+        artifact: tglock-macos-x64
+      - os: ubuntu-latest
+        target: x86_64-unknown-linux-gnu
+        artifact: tglock-linux-x64
+```
+
+## Что изменилось: v1 vs v2
+
+| | v1 | v2 |
+|---|---|---|
+| DC detection | IP-маппинг (ненадёжен) | AES-256-CTR из init (точно) |
+| Ping/Pong | Игнорировался → обрыв через 2 мин | `biased` select → мгновенный Pong |
+| flush() | Нет → потеря данных | Явный flush после каждого write |
+| WS timeout | Нет → бесконечное зависание | 10 секунд |
+| Платформы | Windows | Windows, macOS, Linux |
+| DNS | Менял системный DNS | Не трогает |
+| Адаптеры | Определял сетевой адаптер (баг с VMware) | Не определяет, не нужно |
+| Порт | Хардкод 1080 | Настраиваемый |
+| LAN | Нет | Чекбокс, 0.0.0.0 |
+| Файлов | 4 модуля + bat-скрипт | 2 файла |
+| Строк | ~800 | ~350 |
+
+Половину кода удалил. Стало стабильнее.
+
+## Сравнение с альтернативами (2026)
+
+| | GoodbyeDPI | Zapret | VPN | **TGLock v2** |
 |---|---|---|---|---|
-| Метод | Фрагментация | Desync | Туннель | WebSocket |
-| Обходит IP-шейпинг | Нет | Нет | Да | **Да** |
+| Подход | Фрагментация | Desync | Туннель | WebSocket |
+| IP-шейпинг | Не обходит | Не обходит | Обходит | **Обходит** |
+| macOS | Нет | CLI | Да | **GUI** |
 | Нужен сервер | Нет | Нет | Да | **Нет** |
 | Весь трафик | Нет | Нет | Да | **Только Telegram** |
-| Кроссплатформа | Windows | Win/Mac/Linux | Да | **Win/Mac/Linux** |
-| Размер | ~1 МБ | ~2 МБ | Зависит | **~6 МБ** |
+| LAN-шаринг | Нет | Можно настроить | Да | **Чекбокс** |
+| Стоимость | 0₽ | 0₽ | $3–10/мес | **0₽** |
 
-## Цифры
+## Цифры v2
 
-- **300** строк кода (proxy + UI)
-- **2** файла (`proxy.rs` + `main.rs`)
-- **3** платформы (Windows, macOS, Linux)
+- **350** строк кода
+- **2** файла
+- **4** платформы (Win x64, macOS ARM64, macOS x64, Linux x64)
+- **0** строк платформо-специфичного кода
 - **0** серверов
 - **0₽**
 
 ## Скачать
 
-**[github.com/by-sonic/tglock](https://github.com/by-sonic/tglock)** → Releases
+**[github.com/by-sonic/tglock](https://github.com/by-sonic/tglock)** → [Releases](https://github.com/by-sonic/tglock/releases/latest)
 
-Или собрать: `git clone ... && cargo build --release`
+Или собрать:
 
-**P.S.** Для полного обхода блокировок (YouTube, Discord, Instagram) — **[by sonic VPN](https://t.me/bysonicvpn_bot)**.
+```bash
+git clone https://github.com/by-sonic/tglock.git
+cd tglock
+cargo build --release
+```
+
+macOS: после скачивания `xattr -cr tglock-macos-arm64 && chmod +x tglock-macos-arm64`
+
+**P.S.** Для полного обхода блокировок (YouTube, Discord, Instagram и всё остальное) — **[by sonic VPN](https://t.me/bysonicvpn_bot)**.
 
 ---
 
 *by sonic*
 
-**Теги:** telegram, rust, websocket, socks5, mtproto, dpi, обход блокировок, open-source
+**Теги:** telegram, rust, websocket, macos, socks5, mtproto, обход блокировок, open-source, кроссплатформенность
 
-**Хабы:** Rust · Open source · Сетевые технологии
+**Хабы:** Rust · Open source · macOS · Сетевые технологии
