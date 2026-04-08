@@ -29,8 +29,9 @@ impl Stats {
     }
 }
 
-pub async fn run(stats: Arc<Stats>) -> Result<(), String> {
-    let addr = format!("127.0.0.1:{}", PORT);
+pub async fn run(stats: Arc<Stats>, lan: bool) -> Result<(), String> {
+    let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
+    let addr = format!("{}:{}", host, PORT);
     let listener = TcpListener::bind(&addr)
         .await
         .map_err(|e| format!("Port {} busy: {}", PORT, e))?;

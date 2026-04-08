@@ -93,6 +93,7 @@ struct App {
     stats: Arc<proxy::Stats>,
     log: Arc<Mutex<Vec<LogLine>>>,
     started_at: Option<Instant>,
+    lan_mode: bool,
 }
 
 impl App {
@@ -101,6 +102,7 @@ impl App {
             stats: proxy::Stats::new(),
             log: Arc::new(Mutex::new(Vec::new())),
             started_at: None,
+            lan_mode: false,
         }
     }
 
@@ -113,12 +115,13 @@ impl App {
         self.started_at = Some(Instant::now());
         let stats = self.stats.clone();
         let lg = self.log.clone();
+        let lan = self.lan_mode;
 
         log(&lg, "Запускаю прокси...", false);
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let r = rt.block_on(proxy::run(stats));
+            let r = rt.block_on(proxy::run(stats, lan));
             if let Err(e) = r {
                 log(&lg, &format!("Ошибка: {}", e), true);
             }
@@ -126,7 +129,11 @@ impl App {
 
         std::thread::sleep(std::time::Duration::from_millis(250));
         if self.running() {
-            log(&self.log, &format!("SOCKS5 на 127.0.0.1:{}", proxy::PORT), false);
+            let addr = if lan { "0.0.0.0" } else { "127.0.0.1" };
+            log(&self.log, &format!("SOCKS5 на {}:{}", addr, proxy::PORT), false);
+            if lan {
+                log(&self.log, "LAN-режим: другие устройства могут подключаться", false);
+            }
         }
     }
 
@@ -250,6 +257,21 @@ impl eframe::App for App {
 
                 ui.add_space(20.0);
 
+                // LAN toggle (only when stopped)
+                if !on {
+                    ui.horizontal(|ui| {
+                        let center = ui.available_width() / 2.0 - 90.0;
+                        ui.add_space(center);
+                        ui.checkbox(&mut self.lan_mode, "");
+                        ui.colored_label(TEXT2, egui::RichText::new("Локальная сеть").size(12.0));
+                        ui.colored_label(
+                            egui::Color32::from_rgb(80, 85, 95),
+                            egui::RichText::new("(0.0.0.0 — для всех устройств)").size(10.5),
+                        );
+                    });
+                    ui.add_space(8.0);
+                }
+
                 // Big button
                 if !on {
                     let btn = ui.add_sized(
@@ -286,11 +308,17 @@ impl eframe::App for App {
                         ui.colored_label(TEXT, egui::RichText::new("Настройка Telegram").size(14.0).strong());
                         ui.add_space(6.0);
 
+                        let server_addr = if self.lan_mode && on {
+                            local_ip().unwrap_or_else(|| "127.0.0.1".into())
+                        } else {
+                            "127.0.0.1".into()
+                        };
+
                         if on {
                             if ui.add(egui::Button::new(
                                 egui::RichText::new("Настроить автоматически").size(13.0).color(ACCENT)
                             ).frame(false)).clicked() {
-                                let _ = open::that(format!("tg://socks?server=127.0.0.1&port={}", proxy::PORT));
+                                let _ = open::that(format!("tg://socks?server={}&port={}", server_addr, proxy::PORT));
                                 log(&self.log, "Открываю настройку Telegram...", false);
                             }
                             ui.add_space(4.0);
@@ -301,7 +329,7 @@ impl eframe::App for App {
 
                         egui::Grid::new("cfg").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
                             ui.colored_label(TEXT2, "Сервер");
-                            ui.monospace("127.0.0.1");
+                            ui.monospace(&server_addr);
                             ui.end_row();
                             ui.colored_label(TEXT2, "Порт");
                             ui.monospace(format!("{}", proxy::PORT));
@@ -328,4 +356,10 @@ fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
         ui.colored_label(TEXT2, egui::RichText::new(label).size(10.0));
         ui.colored_label(TEXT, egui::RichText::new(value).size(13.0).strong().monospace());
     });
+}
+
+fn local_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
 }
