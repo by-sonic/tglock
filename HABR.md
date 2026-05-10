@@ -278,7 +278,7 @@ cargo build --release
 
 macOS: после скачивания `xattr -cr tglock-macos-arm64 && chmod +x tglock-macos-arm64`
 
-**P.S.** Для полного обхода блокировок (YouTube, Discord, Instagram и всё остальное) — **[by sonic VPN](https://t.me/bysonicvpn_bot)**.
+**P.S.** Для полного обхода блокировок (YouTube, Discord, Instagram и всё остальное) — **[RoseVPN](https://t.me/rosevpnru_bot)**.
 
 ---
 

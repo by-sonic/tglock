@@ -185,13 +185,13 @@ impl eframe::App for App {
                 .inner_margin(egui::Margin::symmetric(12, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.colored_label(ACCENT, egui::RichText::new("by sonic VPN").size(12.0).strong());
+                        ui.colored_label(ACCENT, egui::RichText::new("RoseVPN").size(12.0).strong());
                         ui.colored_label(TEXT2, egui::RichText::new("Обход для всех приложений").size(11.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.add(egui::Button::new(
-                                egui::RichText::new("@bysonicvpn_bot").size(11.0).strong().color(ACCENT)
+                                egui::RichText::new("@rosevpnru_bot").size(11.0).strong().color(ACCENT)
                             ).frame(false)).clicked() {
-                                let _ = open::that("https://t.me/bysonicvpn_bot");
+                                let _ = open::that("https://t.me/rosevpnru_bot");
                             }
                         });
                     });
