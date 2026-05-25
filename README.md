@@ -1,79 +1,258 @@
-<!-- ROSEVPN-BANNER-START -->
+<!-- ════════════════════════ ROSEVPN — sponsor ════════════════════════ -->
+
 <p align="center">
   <a href="https://t.me/rosevpnru_bot">
-    <img alt="RoseVPN — быстрый VPN" src="https://img.shields.io/badge/%F0%9F%8C%B9%20RoseVPN-%D0%9F%D0%BE%D0%B4%D0%BA%D0%BB%D1%8E%D1%87%D0%B8%D1%82%D1%8C%D1%81%D1%8F%20%D0%B2%20Telegram-E63946?style=for-the-badge&logo=telegram&logoColor=white&labelColor=1a1a1a" height="40"/>
+    <img src="https://img.shields.io/badge/%F0%9F%8C%B9%20RoseVPN-%D0%9F%D0%BE%D0%BF%D1%80%D0%BE%D0%B1%D0%BE%D0%B2%D0%B0%D1%82%D1%8C%20%D0%B1%D0%B5%D1%81%D0%BF%D0%BB%D0%B0%D1%82%D0%BD%D0%BE-E63946?style=for-the-badge&logo=telegram&logoColor=white&labelColor=0a0a0a" height="44" alt="RoseVPN — попробовать бесплатно в Telegram"/>
   </a>
 </p>
+
 <p align="center">
-  <sub><b>Быстрый VPN с обходом YouTube, Discord, Instagram</b> · Бесплатный пробный период · Подключение за 30 секунд через бот <a href="https://t.me/rosevpnru_bot">@rosevpnru_bot</a></sub>
+  <b>Быстрый VPN для России</b> — YouTube без буферизации, Discord/Instagram/ChatGPT снова работают.<br/>
+  <sub>Подключение в Telegram через <a href="https://t.me/rosevpnru_bot"><b>@rosevpnru_bot</b></a> — бесплатный пробный период, без регистрации, без карты.</sub>
+</p>
+
+<p align="center">
+  <a href="https://t.me/rosevpnru_bot"><img alt="YouTube — без буферов" src="https://img.shields.io/badge/YouTube-%D0%B1%D0%B5%D0%B7%20%D0%B1%D1%83%D1%84%D0%B5%D1%80%D0%BE%D0%B2-E63946?style=flat-square&logo=youtube&logoColor=white"></a>
+  <a href="https://t.me/rosevpnru_bot"><img alt="Discord — голос работает" src="https://img.shields.io/badge/Discord-%D0%B3%D0%BE%D0%BB%D0%BE%D1%81%20%D1%80%D0%B0%D0%B1%D0%BE%D1%82%D0%B0%D0%B5%D1%82-E63946?style=flat-square&logo=discord&logoColor=white"></a>
+  <a href="https://t.me/rosevpnru_bot"><img alt="Instagram — открывается" src="https://img.shields.io/badge/Instagram-%D0%BE%D1%82%D0%BA%D1%80%D1%8B%D0%B2%D0%B0%D0%B5%D1%82%D1%81%D1%8F-E63946?style=flat-square&logo=instagram&logoColor=white"></a>
+  <a href="https://t.me/rosevpnru_bot"><img alt="ChatGPT — доступен" src="https://img.shields.io/badge/ChatGPT-%D0%B4%D0%BE%D1%81%D1%82%D1%83%D0%BF%D0%B5%D0%BD-E63946?style=flat-square&logo=openai&logoColor=white"></a>
 </p>
 
 ---
 
-<!-- ROSEVPN-BANNER-END -->
+<!-- ═════════════════════════════ TGLOCK ═════════════════════════════ -->
 
-<p align="center">
-  <h1 align="center">TGLock</h1>
-  <p align="center"><b>Обход блокировки Telegram через WebSocket-туннель</b></p>
-  <p align="center">Без VPN. Без серверов. Без абонентки. Один клик.</p>
-  <p align="center">
-    <a href="https://github.com/by-sonic/tglock/releases/latest"><img src="https://img.shields.io/github/v/release/by-sonic/tglock?style=flat-square&color=blue" alt="Release"></a>
-    <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-333?style=flat-square" alt="Platform">
-    <img src="https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust" alt="Rust">
-    <a href="LICENSE"><img src="https://img.shields.io/github/license/by-sonic/tglock?style=flat-square" alt="MIT"></a>
-  </p>
+<div align="center">
+
+# 🔓 TGLock
+
+### Обход блокировки Telegram через WebSocket-туннель
+
+**Один клик. Без VPN. Без серверов. Без подписки.**
+
+<p>
+  <a href="https://github.com/by-sonic/tglock/releases/latest"><img alt="Скачать последний релиз" src="https://img.shields.io/github/v/release/by-sonic/tglock?style=for-the-badge&color=2ea043&label=%D1%81%D0%BA%D0%B0%D1%87%D0%B0%D1%82%D1%8C"></a>
+  <a href="https://github.com/by-sonic/tglock/releases"><img alt="Всего загрузок" src="https://img.shields.io/github/downloads/by-sonic/tglock/total?style=for-the-badge&color=0969da&label=%D0%B7%D0%B0%D0%B3%D1%80%D1%83%D0%B7%D0%BE%D0%BA"></a>
+  <a href="https://github.com/by-sonic/tglock/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/by-sonic/tglock?style=for-the-badge&color=f5a623"></a>
 </p>
+
+<p>
+  <img alt="Windows" src="https://img.shields.io/badge/Windows-0078D6?style=flat&logo=windows&logoColor=white">
+  <img alt="macOS" src="https://img.shields.io/badge/macOS-000000?style=flat&logo=apple&logoColor=white">
+  <img alt="Linux" src="https://img.shields.io/badge/Linux-FCC624?style=flat&logo=linux&logoColor=black">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-CE422B?style=flat&logo=rust&logoColor=white">
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/github/license/by-sonic/tglock?style=flat&color=lightgrey"></a>
+</p>
+
+</div>
+
+> **Telegram стал тормозить или перестал открываться?** Запусти TGLock — и мессенджер снова работает. Не нужны VPN, прокси-серверы, абонентская плата или регистрация. Один бинарник на 6 МБ.
 
 ---
 
-## Скачать
+## 🤔 Что это и зачем
 
-**[Последний релиз](https://github.com/by-sonic/tglock/releases/latest)**
+TGLock — это **локальный SOCKS5-прокси** на твоём компьютере. Он перехватывает соединения Telegram, заворачивает их в WebSocket и отправляет через `web.telegram.org`. Провайдер видит обычный HTTPS — Telegram работает как раньше.
 
-| Файл | Платформа |
-|---|---|
-| `tglock.exe` | Windows x64 |
-| `tglock-macos-arm64` | macOS Apple Silicon (M1–M4) |
-| `tglock-macos-x64` | macOS Intel |
-| `tglock-linux-x64` | Linux x64 |
+**Кому подойдёт:**
 
-## Как пользоваться
+- 📱 Telegram заблокировали в России или он стал открываться через раз
+- 🐌 Голосовые/видеозвонки рвутся, сообщения уходят с задержкой, фото не грузятся
+- 🛡 GoodbyeDPI, Zapret или ByeDPI больше не помогают — провайдер шейпит **по IP**
+- 🍎 Нужен инструмент для **macOS** (а на маке нет нормальных GUI-альтернатив)
+- 💻 Хочется решение для **Windows, macOS или Linux** без подписок и серверов
 
-1. Скачай и запусти
-2. Нажми **ПОДКЛЮЧИТЬ**
-3. Нажми **Настроить автоматически** → в Telegram нажми «Подключить»
-4. Готово
+**Чем отличается от VPN:** TGLock работает **только с Telegram**. Остальной трафик идёт напрямую — ничего не замедляется, ничего не логируется, мобильный/домашний трафик не расходуется впустую.
 
-Ручная настройка: Telegram → Настройки → Продвинутые → Тип соединения → SOCKS5 → `127.0.0.1:1080`
+---
 
-## Как это работает
+## ⚡ Скачать
+
+**[👉 Последний релиз](https://github.com/by-sonic/tglock/releases/latest)**
+
+| Платформа | Файл | Размер |
+|---|---|---|
+| **Windows 10/11** (x64) | `tglock.exe` | ~6 МБ |
+| **macOS Apple Silicon** (M1–M4) | `tglock-macos-arm64` | ~6 МБ |
+| **macOS Intel** | `tglock-macos-x64` | ~6 МБ |
+| **Linux** (x86_64) | `tglock-linux-x64` | ~6 МБ |
+
+> **🍎 macOS:** после скачивания запусти в Терминале:
+> ```bash
+> xattr -cr ~/Downloads/tglock-macos-arm64
+> chmod +x ~/Downloads/tglock-macos-arm64
+> ```
+> Это снимает блокировку Gatekeeper «приложение не проверено». Альтернатива — подписать билд Developer ID за $99/год, что для бесплатного open-source перебор.
+
+---
+
+## 🚀 Как пользоваться
+
+1. **Скачай и запусти** бинарник для своей системы
+2. Нажми **«ПОДКЛЮЧИТЬ»** в окне приложения
+3. Нажми **«Настроить автоматически»** → в Telegram появится диалог «Подключить SOCKS5-прокси?» → жми **«Подключить»**
+4. ✅ **Telegram работает.** Можно сворачивать TGLock — он живёт в фоне.
+
+### Ручная настройка (если автоматическая не сработала)
+
+Telegram → Настройки → **Продвинутые** → Тип соединения → **Использовать прокси** → **SOCKS5**
+
+- Сервер: `127.0.0.1`
+- Порт: `1080`
+
+### 🏠 LAN-режим — один прокси на всю квартиру
+
+В окне TGLock включи галочку **LAN** — приложение начнёт слушать на `0.0.0.0`. Все устройства в твоей домашней сети (телефон, планшет, ноутбук, телевизор) смогут подключиться к `<твой-IP>:1080` и тоже получить рабочий Telegram. IP отобразится прямо в интерфейсе TGLock — копируй и вписывай в настройки Telegram на остальных устройствах.
+
+Удобно, если дома один комп всегда включён — он становится «домашним Telegram-роутером».
+
+---
+
+## 🔬 Как это работает
 
 ```
-Telegram Desktop → SOCKS5 (127.0.0.1:1080) → TGLock → WSS (web.telegram.org) → DC
+Telegram Desktop / mobile (через LAN)
+              ▼
+   SOCKS5 (127.0.0.1:1080 или 0.0.0.0:1080)
+              ▼
+        TGLock — читает первые 64 байта
+                 obfuscated2 init-пакета,
+                 расшифровывает AES-256-CTR,
+                 достаёт номер DC
+              ▼
+   WSS → kws{dc}.web.telegram.org
+              ▼
+        Telegram Data Center
 ```
 
-1. Локальный SOCKS5-прокси перехватывает соединения Telegram
-2. Из MTProto init-пакета извлекается номер DC (AES-256-CTR)
-3. Трафик заворачивается в WebSocket через `kws{dc}.web.telegram.org`
-4. Провайдер видит обычный HTTPS к `web.telegram.org`
-5. Остальной трафик проходит напрямую
+1. **Локальный SOCKS5-прокси** перехватывает соединения Telegram Desktop.
+2. Из первых 64 байт `obfuscated2`-пакета **расшифровывается номер DC** — AES-256-CTR, ключ в байтах `[8..40]`, IV в `[40..56]`, DC ID — `i32` в `[60..64]`.
+3. Трафик заворачивается в **WebSocket** к `kws{dc}.web.telegram.org` — это **тот же домен**, через который работает Telegram Web в браузере.
+4. Провайдер видит **TLS-handshake к `web.telegram.org`** — это легитимный HTTPS. DPI не видит MTProto. IP-шейпинг не работает, потому что `web.telegram.org` не блокируется в принципе.
+5. Весь остальной трафик (не-Telegram) проходит **напрямую** — без замедления.
 
-## Почему не GoodbyeDPI / Zapret?
+📖 **Подробный технический разбор архитектуры** — см. [HABR.md](HABR.md) (≈7 мин чтения, история v1 → v2, AES-decrypt, bias `select!` для Pong, кроссплатформенная сборка).
 
-GoodbyeDPI и Zapret фрагментируют пакеты чтобы обмануть DPI. Но если провайдер **шейпит по IP** — они бесполезны.
+---
 
-TGLock маскирует трафик под обычный HTTPS. DPI не видит MTProto. IP-шейпинг не работает — `web.telegram.org` не блокируется.
+## 🆚 Сравнение с альтернативами
 
-## Стек
+| | GoodbyeDPI | Zapret | AmneziaVPN | **TGLock** |
+|---|:---:|:---:|:---:|:---:|
+| Подход | Фрагментация пакетов | TCP/UDP desync | Полноценный VPN-туннель | **WebSocket-туннель** |
+| Обходит IP-шейпинг | ❌ | ❌ | ✅ | **✅** |
+| macOS (GUI) | ❌ Windows only | ❌ только CLI | ✅ | **✅** |
+| Нужен сервер / подписка | ❌ | ❌ | ✅ ($) | **❌** |
+| Только Telegram | ❌ | ❌ | ❌ | **✅** |
+| LAN-шаринг | ❌ | сложно | ✅ | **✅ (галочка)** |
+| Размер | ~200 КБ | ~5 МБ | ~80 МБ | **~6 МБ** |
+| Цена | 0 ₽ | 0 ₽ | $3–10/мес | **0 ₽** |
 
-| | |
+> **⚠ Когда TGLock не подойдёт:** если заблокирован не только Telegram, а ещё YouTube, Discord, Instagram, ChatGPT, Spotify — нужен полноценный VPN. Тут поможет **[🌹 RoseVPN](https://t.me/rosevpnru_bot)** (см. блок ниже).
+
+---
+
+## ❓ Часто задаваемые вопросы
+
+<details>
+<summary><b>Telegram заблокировали в России — это правда?</b></summary>
+
+Полностью Telegram в РФ не заблокирован, но провайдеры **замедляют** трафик через DPI и **шейпят по IP-диапазонам** Telegram DC (149.154.160–175, 91.108.4–8, 91.108.56–59 и др.). У части пользователей мессенджер открывается через раз, голосовые звонки рвутся, видео не грузится, фото уходят минутами. TGLock решает именно эту проблему — заворачивает Telegram-трафик в HTTPS к `web.telegram.org`, который не блокируется.
+</details>
+
+<details>
+<summary><b>Это безопасно? Что с моими данными?</b></summary>
+
+TGLock — **локальный прокси**. Он работает только на твоём компьютере и не отправляет данные третьим сторонам. Соединение идёт напрямую к серверам Telegram через их же домен `web.telegram.org` — тот же, что использует Telegram Web в браузере. Кода ~350 строк, всё открыто на GitHub — можно прочитать и собрать самому.
+</details>
+
+<details>
+<summary><b>Чем отличается от GoodbyeDPI / Zapret / ByeDPI?</b></summary>
+
+GoodbyeDPI, Zapret и ByeDPI **фрагментируют пакеты**, чтобы DPI не распознал MTProto. Это работает, пока провайдер блокирует *по содержимому*. Но если шейпинг идёт **по IP** (а так делают большинство крупных РФ-провайдеров с 2024–2026 — Ростелеком, МТС, Билайн, Мегафон), фрагментация не помогает: пакеты всё равно идут на «нехороший» IP и троттлятся.
+
+TGLock же отправляет трафик на **`web.telegram.org`** — обычный HTTPS-домен, который не блокируется в принципе.
+</details>
+
+<details>
+<summary><b>Работает ли на iPhone или Android?</b></summary>
+
+Напрямую — нет, TGLock сам по себе только для desktop. Но если включить **LAN-режим** на компьютере, в настройках Telegram на телефоне можно указать SOCKS5-прокси с IP компа. Telegram на мобиле начнёт ходить через ПК. Удобно, если дома один компьютер всегда включён.
+
+Для полностью мобильного решения нужен VPN — например, **[🌹 RoseVPN](https://t.me/rosevpnru_bot)** с приложением Karing для iOS/Android.
+</details>
+
+<details>
+<summary><b>Замедляет ли TGLock интернет?</b></summary>
+
+Нет. Через прокси идёт **только** трафик Telegram (фильтрация по IP-диапазонам Telegram DC). YouTube, браузер, игры, торренты — всё это идёт напрямую и не замедляется. В этом главное отличие от VPN.
+</details>
+
+<details>
+<summary><b>Apple ругается «приложение не проверено / нельзя открыть»</b></summary>
+
+Подпись Apple Developer ID стоит $99 в год — для бесплатного open-source это перебор. Сними блокировку Gatekeeper руками — открой Терминал и выполни:
+
+```bash
+xattr -cr ~/Downloads/tglock-macos-arm64
+chmod +x ~/Downloads/tglock-macos-arm64
+```
+
+После этого приложение запустится двойным кликом из Finder.
+</details>
+
+<details>
+<summary><b>Telegram пишет «прокси не настроен» или сразу отключается</b></summary>
+
+Открой TGLock — он должен показывать **«ПОДКЛЮЧЕНО»** и хотя бы одно активное соединение, когда Telegram пытается работать. Если соединений ноль:
+
+- Не запущен ли уже другой прокси на порту 1080? В TGLock можно поменять порт в настройках.
+- Антивирус/файрвол не блокирует localhost-подключения?
+- В настройках Telegram сервер указан как `127.0.0.1`, не `localhost` — на некоторых системах это разные сетевые стеки.
+- На macOS — убедись что снят Gatekeeper (`xattr -cr ...`).
+</details>
+
+<details>
+<summary><b>Порт 1080 уже занят другим приложением</b></summary>
+
+В окне TGLock есть поле **«Порт»** — поменяй на любой свободный (например, `10800`, `1081`, `8888`). После рестарта прокси автоматически обновит deep-link для Telegram. В настройках Telegram укажи новый порт.
+</details>
+
+<details>
+<summary><b>А что если провайдер заблокирует и <code>web.telegram.org</code>?</b></summary>
+
+Тогда TGLock перестанет работать у этого конкретного провайдера. Но **публичная блокировка веб-версии Telegram** — это большой шаг, и Роскомнадзор пока на него не идёт. Если всё же случится — используй **[🌹 RoseVPN](https://t.me/rosevpnru_bot)**, там домен фронтирования автоматически меняется (SNI rotation, Reality), и пробивает даже агрессивный DPI.
+</details>
+
+<details>
+<summary><b>Можно ли использовать TGLock как обычный SOCKS5 для других приложений?</b></summary>
+
+Не рекомендуется. TGLock детектирует Telegram-трафик по IP получателя и оборачивает в WebSocket только его. Остальное идёт напрямую — без шифрования и аутентификации, как обычный SOCKS5-релей. Для других приложений возьми правильный SOCKS5-сервер (или VPN).
+</details>
+
+<details>
+<summary><b>Где скачать новые версии? Будут ли обновления?</b></summary>
+
+Все релизы — на странице **[GitHub Releases](https://github.com/by-sonic/tglock/releases)**. При пуше тега `v*` GitHub Actions автоматически собирает бинарники для всех 4 платформ и публикует. Подпишись на репозиторий (кнопка **Watch** → **Custom** → **Releases**), чтобы получать уведомления о новых версиях.
+</details>
+
+---
+
+## 🛠 Стек технологий
+
+| Технология | Зачем |
 |---|---|
-| Rust | Один бинарник, нативная скорость |
-| egui | GUI без браузера и Electron |
-| tokio | Async I/O |
-| tokio-tungstenite | WebSocket + TLS |
+| **Rust** | Один бинарник, нативная скорость, без runtime-зависимостей |
+| **egui** (`eframe`) | Кроссплатформенный GUI — без браузера, без Electron, без Qt |
+| **tokio** | Async I/O для тысяч одновременных соединений |
+| **tokio-tungstenite** | WebSocket-клиент с TLS поверх `native-tls` |
+| **aes** + **ctr** | Расшифровка MTProto `obfuscated2` init-пакета |
 
-## Сборка
+**Размер бинарника:** ~6 МБ. **Памяти в простое:** ~15 МБ.
+
+---
+
+## 🏗 Сборка из исходников
 
 ```bash
 git clone https://github.com/by-sonic/tglock.git
@@ -81,14 +260,43 @@ cd tglock
 cargo build --release
 ```
 
-## VPN
+Результат — `target/release/tglock` (или `tglock.exe` на Windows). Требуется Rust **stable 1.75+**.
 
-Для обхода блокировок **всех** приложений — **[RoseVPN](https://t.me/rosevpnru_bot)**
+### Кросс-компиляция через GitHub Actions
 
-## Лицензия
-
-MIT
+Хочешь собрать свой релиз? Форкни репозиторий, поставь тег `v1.0.1`, и `.github/workflows/release.yml` сам соберёт бинарники под Windows x64, macOS ARM64, macOS Intel и Linux x64.
 
 ---
 
-<p align="center"><b>by sonic</b></p>
+## 🌹 Нужен VPN на всё подряд?
+
+Если у тебя заблокирован **не только Telegram**, а ещё YouTube, Discord, Instagram, ChatGPT, Spotify — обходить каждое приложение отдельно нет смысла. Возьми VPN, который умеет всё сразу.
+
+<p align="center">
+  <a href="https://t.me/rosevpnru_bot">
+    <img alt="Подключить RoseVPN — Telegram-бот" src="https://img.shields.io/badge/%F0%9F%8C%B9%20RoseVPN-%D0%9F%D0%BE%D0%B4%D0%BA%D0%BB%D1%8E%D1%87%D0%B8%D1%82%D1%8C%20%D0%B2%20Telegram-E63946?style=for-the-badge&logo=telegram&logoColor=white&labelColor=0a0a0a" height="40"/>
+  </a>
+</p>
+
+**Что внутри RoseVPN:**
+
+- 🔥 **Hysteria2 + VLESS-Reality fallback** — обходит TSPU и агрессивный DPI
+- 🛡 **Без логов трафика** — приватность по умолчанию
+- 🎁 **Бесплатный пробный период** — без карты, без регистрации
+- 📱 **Karing-клиент** с автонастройкой — установка в 2 тапа
+- 💻 **Windows, macOS, iOS, Android** — везде нативные приложения
+- 🔄 **SNI-ротация** на случай новых блокировок
+
+Подключение — через Telegram-бот **[@rosevpnru_bot](https://t.me/rosevpnru_bot)**.
+
+---
+
+## 📄 Лицензия
+
+[MIT](LICENSE) — делай что хочешь. Форки, модификации, использование в коммерческих проектах — всё разрешено. Ссылка на репозиторий приветствуется, но необязательна.
+
+---
+
+<p align="center">
+  <sub><b>by sonic</b> · <a href="https://t.me/rosevpnru_bot">@rosevpnru_bot</a> · <a href="https://github.com/by-sonic/tglock/issues">Issues & feedback</a></sub>
+</p>
