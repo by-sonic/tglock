@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags: ["v*"]
 
@@ -16,15 +17,15 @@ jobs:
         include:
           - platform: macOS universal
             os: macos-14
-            args: --target universal-apple-darwin
+            args: --bundles app,dmg --target universal-apple-darwin
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
           - platform: Windows x64
             os: windows-latest
-            args: --target x86_64-pc-windows-msvc
+            args: --bundles nsis --target x86_64-pc-windows-msvc
             rust-targets: x86_64-pc-windows-msvc
           - platform: Linux x64
             os: ubuntu-22.04
-            args: --target x86_64-unknown-linux-gnu
+            args: --bundles appimage,deb --target x86_64-unknown-linux-gnu
             rust-targets: x86_64-unknown-linux-gnu
 
     runs-on: ${{ matrix.os }}
