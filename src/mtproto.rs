@@ -1,0 +1,318 @@
+use aes::Aes256;
+use cipher::{KeyIvInit, StreamCipher};
+use rand::{rngs::OsRng, RngCore};
+use sha2::{Digest, Sha256};
+#[cfg(not(test))]
+use std::path::PathBuf;
+
+type AesCtr = ctr::Ctr128BE<Aes256>;
+
+const INIT_LEN: usize = 64;
+const KEY_START: usize = 8;
+const KEY_END: usize = 40;
+const IV_END: usize = 56;
+const TAG_START: usize = 56;
+const DC_START: usize = 60;
+
+const ABRIDGED: [u8; 4] = [0xef; 4];
+const INTERMEDIATE: [u8; 4] = [0xee; 4];
+const PADDED_INTERMEDIATE: [u8; 4] = [0xdd; 4];
+
+pub struct ClientInit {
+    pub dc: u16,
+    pub media: bool,
+    pub relay_init: [u8; INIT_LEN],
+    pub crypto: CryptoContext,
+}
+
+pub struct CryptoContext {
+    client_decrypt: AesCtr,
+    client_encrypt: AesCtr,
+    telegram_encrypt: AesCtr,
+    telegram_decrypt: AesCtr,
+}
+
+impl CryptoContext {
+    pub fn client_to_telegram(&mut self, data: &mut [u8]) {
+        self.client_decrypt.apply_keystream(data);
+        self.telegram_encrypt.apply_keystream(data);
+    }
+
+    pub fn telegram_to_client(&mut self, data: &mut [u8]) {
+        self.telegram_decrypt.apply_keystream(data);
+        self.client_encrypt.apply_keystream(data);
+    }
+}
+
+pub fn generate_secret() -> [u8; 16] {
+    let mut secret = [0; 16];
+    OsRng.fill_bytes(&mut secret);
+    secret
+}
+
+#[cfg(not(test))]
+pub fn load_or_create_secret() -> [u8; 16] {
+    let Some(path) = secret_path() else {
+        return generate_secret();
+    };
+    if let Ok(value) = std::fs::read_to_string(&path) {
+        if let Some(secret) = parse_secret_hex(value.trim()) {
+            return secret;
+        }
+    }
+
+    let secret = generate_secret();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    write_secret_file(&path, &secret_hex(&secret));
+    secret
+}
+
+#[cfg(not(test))]
+fn secret_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|path| path.join("TGLock").join("secret"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|path| path.join("Library/Application Support/TGLock/secret"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(path).join("tglock").join("secret"));
+        }
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|path| path.join(".config/tglock/secret"))
+    }
+}
+
+#[cfg(all(not(test), unix))]
+fn write_secret_file(path: &std::path::Path, value: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+    {
+        let _ = file.write_all(value.as_bytes());
+    }
+}
+
+#[cfg(all(not(test), not(unix)))]
+fn write_secret_file(path: &std::path::Path, value: &str) {
+    let _ = std::fs::write(path, value);
+}
+
+pub fn secret_hex(secret: &[u8; 16]) -> String {
+    let mut output = String::with_capacity(32);
+    for byte in secret {
+        use std::fmt::Write;
+        let _ = write!(output, "{:02x}", byte);
+    }
+    output
+}
+
+fn parse_secret_hex(value: &str) -> Option<[u8; 16]> {
+    if value.len() != 32 {
+        return None;
+    }
+    let mut secret = [0; 16];
+    for (index, byte) in secret.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(secret)
+}
+
+pub fn telegram_secret(secret: &[u8; 16]) -> String {
+    format!("dd{}", secret_hex(secret))
+}
+
+pub fn parse_client_init(init: &[u8; INIT_LEN], secret: &[u8; 16]) -> Option<ClientInit> {
+    let client_dec_key = secret_key(&init[KEY_START..KEY_END], secret);
+    let client_dec_iv: [u8; 16] = init[KEY_END..IV_END].try_into().ok()?;
+    let mut client_decrypt = AesCtr::new((&client_dec_key).into(), (&client_dec_iv).into());
+
+    let mut decrypted = *init;
+    client_decrypt.apply_keystream(&mut decrypted);
+    let protocol_tag: [u8; 4] = decrypted[TAG_START..DC_START].try_into().ok()?;
+    if !matches!(protocol_tag, ABRIDGED | INTERMEDIATE | PADDED_INTERMEDIATE) {
+        return None;
+    }
+
+    let dc_index = i16::from_le_bytes([decrypted[DC_START], decrypted[DC_START + 1]]);
+    let dc = dc_index.unsigned_abs();
+    if !matches!(dc, 1..=5 | 203) {
+        return None;
+    }
+
+    let relay_init = generate_relay_init(protocol_tag, dc_index);
+    let crypto = build_crypto_context(init, secret, &relay_init)?;
+    Some(ClientInit {
+        dc,
+        media: dc_index < 0,
+        relay_init,
+        crypto,
+    })
+}
+
+fn secret_key(prekey: &[u8], secret: &[u8; 16]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(prekey);
+    hash.update(secret);
+    hash.finalize().into()
+}
+
+fn generate_relay_init(protocol_tag: [u8; 4], dc_index: i16) -> [u8; INIT_LEN] {
+    loop {
+        let mut init = [0; INIT_LEN];
+        OsRng.fill_bytes(&mut init);
+        if is_reserved_init(&init) {
+            continue;
+        }
+
+        let key: [u8; 32] = init[KEY_START..KEY_END].try_into().unwrap();
+        let iv: [u8; 16] = init[KEY_END..IV_END].try_into().unwrap();
+        let mut cipher = AesCtr::new((&key).into(), (&iv).into());
+        let mut encrypted = init;
+        cipher.apply_keystream(&mut encrypted);
+
+        let mut tail = [0; 8];
+        tail[..4].copy_from_slice(&protocol_tag);
+        tail[4..6].copy_from_slice(&dc_index.to_le_bytes());
+        OsRng.fill_bytes(&mut tail[6..]);
+        for index in 0..8 {
+            init[TAG_START + index] ^= tail[index] ^ encrypted[TAG_START + index];
+        }
+        return init;
+    }
+}
+
+fn is_reserved_init(init: &[u8; INIT_LEN]) -> bool {
+    init[0] == 0xef
+        || &init[..4] == b"HEAD"
+        || &init[..4] == b"POST"
+        || &init[..4] == b"GET "
+        || init[..4] == [0xee; 4]
+        || init[..4] == [0xdd; 4]
+        || init[..4] == [0x16, 0x03, 0x01, 0x02]
+        || init[4..8] == [0; 4]
+}
+
+fn build_crypto_context(
+    client_init: &[u8; INIT_LEN],
+    secret: &[u8; 16],
+    relay_init: &[u8; INIT_LEN],
+) -> Option<CryptoContext> {
+    let client_dec_key = secret_key(&client_init[KEY_START..KEY_END], secret);
+    let client_dec_iv: [u8; 16] = client_init[KEY_END..IV_END].try_into().ok()?;
+    let mut client_decrypt = AesCtr::new((&client_dec_key).into(), (&client_dec_iv).into());
+    client_decrypt.apply_keystream(&mut [0; INIT_LEN]);
+
+    let reversed_client: Vec<_> = client_init[KEY_START..IV_END]
+        .iter()
+        .rev()
+        .copied()
+        .collect();
+    let client_enc_key = secret_key(&reversed_client[..32], secret);
+    let client_enc_iv: [u8; 16] = reversed_client[32..].try_into().ok()?;
+    let client_encrypt = AesCtr::new((&client_enc_key).into(), (&client_enc_iv).into());
+
+    let relay_enc_key: [u8; 32] = relay_init[KEY_START..KEY_END].try_into().ok()?;
+    let relay_enc_iv: [u8; 16] = relay_init[KEY_END..IV_END].try_into().ok()?;
+    let mut telegram_encrypt = AesCtr::new((&relay_enc_key).into(), (&relay_enc_iv).into());
+    telegram_encrypt.apply_keystream(&mut [0; INIT_LEN]);
+
+    let reversed_relay: Vec<_> = relay_init[KEY_START..IV_END]
+        .iter()
+        .rev()
+        .copied()
+        .collect();
+    let relay_dec_key: [u8; 32] = reversed_relay[..32].try_into().ok()?;
+    let relay_dec_iv: [u8; 16] = reversed_relay[32..].try_into().ok()?;
+    let telegram_decrypt = AesCtr::new((&relay_dec_key).into(), (&relay_dec_iv).into());
+
+    Some(CryptoContext {
+        client_decrypt,
+        client_encrypt,
+        telegram_encrypt,
+        telegram_decrypt,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_client_init(secret: &[u8; 16], dc_index: i16) -> [u8; INIT_LEN] {
+    tests::generate_client_init(secret, PADDED_INTERMEDIATE, dc_index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub(super) fn generate_client_init(
+        secret: &[u8; 16],
+        protocol_tag: [u8; 4],
+        dc_index: i16,
+    ) -> [u8; INIT_LEN] {
+        let mut init = generate_relay_init(protocol_tag, dc_index);
+        let key = secret_key(&init[KEY_START..KEY_END], secret);
+        let iv: [u8; 16] = init[KEY_END..IV_END].try_into().unwrap();
+        let mut cipher = AesCtr::new((&key).into(), (&iv).into());
+        let mut encrypted = init;
+        cipher.apply_keystream(&mut encrypted);
+
+        let mut tail = [0; 8];
+        tail[..4].copy_from_slice(&protocol_tag);
+        tail[4..6].copy_from_slice(&dc_index.to_le_bytes());
+        tail[6..].copy_from_slice(&[17, 23]);
+        for index in 0..8 {
+            init[TAG_START + index] ^= tail[index] ^ encrypted[TAG_START + index];
+        }
+        init
+    }
+
+    #[test]
+    fn parses_secret_protected_media_init() {
+        let secret = [42; 16];
+        let init = generate_client_init(&secret, PADDED_INTERMEDIATE, -4);
+        let parsed = parse_client_init(&init, &secret).unwrap();
+        assert_eq!(parsed.dc, 4);
+        assert!(parsed.media);
+    }
+
+    #[test]
+    fn rejects_wrong_secret() {
+        let init = generate_client_init(&[42; 16], INTERMEDIATE, 2);
+        assert!(parse_client_init(&init, &[7; 16]).is_none());
+    }
+
+    #[test]
+    fn telegram_link_secret_has_padded_intermediate_prefix() {
+        assert_eq!(
+            telegram_secret(&[0xab; 16]),
+            "ddabababababababababababababababab"
+        );
+    }
+
+    #[test]
+    fn parses_persisted_secret() {
+        assert_eq!(
+            parse_secret_hex("00112233445566778899aabbccddeeff"),
+            Some([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ])
+        );
+        assert_eq!(parse_secret_hex("not-a-secret"), None);
+    }
+}

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TGLock",
+  "version": "2.0.0-beta.1",
+  "identifier": "com.bysonic.tglock",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "dist-ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "TGLock",
+        "width": 460,
+        "height": 620,
+        "minWidth": 460,
+        "minHeight": 620,
+        "resizable": false,
+        "fullscreen": false,
+        "center": true,
+        "backgroundColor": "#070A10",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "category": "Utility",
+    "shortDescription": "Telegram connectivity through a local MTProto proxy",
+    "longDescription": "TGLock restores Telegram connectivity through an adaptive WebSocket tunnel.",
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}

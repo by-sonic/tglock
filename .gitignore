@@ -1,5 +1,8 @@
 /target
+/dist
+/dist-ui
+/node_modules
+/gen
 /tools
-Cargo.lock
 *.zip
 .claude/

@@ -1,384 +1,246 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod mtproto;
 mod proxy;
+mod transport;
 
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tauri::{Manager, State};
 
-use eframe::egui;
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Settings {
+    lan_mode: bool,
+    port: u16,
+    worker_domain: String,
+}
 
-// -- Colors (GitHub Dark inspired) ------------------------------------------
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            lan_mode: false,
+            port: proxy::DEFAULT_PORT,
+            worker_domain: String::new(),
+        }
+    }
+}
 
-const BG: egui::Color32 = egui::Color32::from_rgb(13, 17, 23);
-const SURFACE: egui::Color32 = egui::Color32::from_rgb(22, 27, 34);
-const BORDER: egui::Color32 = egui::Color32::from_rgb(48, 54, 61);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(88, 166, 255);
-const GREEN: egui::Color32 = egui::Color32::from_rgb(63, 185, 80);
-const RED: egui::Color32 = egui::Color32::from_rgb(248, 81, 73);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(230, 237, 243);
-const TEXT2: egui::Color32 = egui::Color32::from_rgb(139, 148, 158);
-const AD_BG: egui::Color32 = egui::Color32::from_rgb(17, 21, 28);
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LogLine {
+    timestamp: String,
+    message: String,
+    error: bool,
+}
 
-fn main() -> eframe::Result<()> {
-    eframe::run_native(
-        "TGLock",
-        eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_inner_size([520.0, 620.0])
-                .with_min_inner_size([420.0, 500.0])
-                .with_title("TGLock"),
-            ..Default::default()
-        },
-        Box::new(|cc| {
-            apply_theme(&cc.egui_ctx);
-            Ok(Box::new(App::new()))
-        }),
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusSnapshot {
+    running: bool,
+    active_connections: u32,
+    tunnels: u32,
+    data_center: Option<u16>,
+    route: String,
+    failures: u32,
+    uptime_seconds: u64,
+    port: u16,
+    logs: Vec<LogLine>,
+}
+
+struct AppState {
+    stats: Arc<proxy::Stats>,
+    settings: Mutex<Settings>,
+    active_port: Mutex<u16>,
+    started_at: Mutex<Option<Instant>>,
+    logs: Arc<Mutex<Vec<LogLine>>>,
+    settings_path: PathBuf,
+}
+
+impl AppState {
+    fn new(settings_path: PathBuf) -> Self {
+        let settings = std::fs::read(&settings_path)
+            .ok()
+            .and_then(|contents| serde_json::from_slice(&contents).ok())
+            .unwrap_or_default();
+        Self {
+            stats: proxy::Stats::new(),
+            settings: Mutex::new(settings),
+            active_port: Mutex::new(proxy::DEFAULT_PORT),
+            started_at: Mutex::new(None),
+            logs: Arc::new(Mutex::new(Vec::new())),
+            settings_path,
+        }
+    }
+
+    fn log(&self, message: impl Into<String>, error: bool) {
+        let mut logs = self.logs.lock().unwrap();
+        logs.push(LogLine {
+            timestamp: current_time(),
+            message: message.into(),
+            error,
+        });
+        if logs.len() > 100 {
+            logs.remove(0);
+        }
+    }
+
+    fn snapshot(&self) -> StatusSnapshot {
+        let data_center = self.stats.last_dc.load(Ordering::Relaxed);
+        let route = match self.stats.last_route.load(Ordering::Relaxed) {
+            1 => "Telegram WebSocket",
+            2 => "Cloudflare Worker",
+            _ => "Автоматический маршрут",
+        };
+        StatusSnapshot {
+            running: self.stats.running.load(Ordering::SeqCst),
+            active_connections: self.stats.active.load(Ordering::Relaxed),
+            tunnels: self.stats.ws.load(Ordering::Relaxed),
+            data_center: (data_center > 0).then_some(data_center),
+            route: route.to_owned(),
+            failures: self.stats.ws_failures.load(Ordering::Relaxed),
+            uptime_seconds: self
+                .started_at
+                .lock()
+                .unwrap()
+                .map_or(0, |started| started.elapsed().as_secs()),
+            port: *self.active_port.lock().unwrap(),
+            logs: self.logs.lock().unwrap().clone(),
+        }
+    }
+
+    fn persist_settings(&self, settings: &Settings) -> Result<(), String> {
+        if let Some(parent) = self.settings_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("Не удалось создать папку настроек: {error}"))?;
+        }
+        let contents = serde_json::to_vec_pretty(settings)
+            .map_err(|error| format!("Не удалось сохранить настройки: {error}"))?;
+        std::fs::write(&self.settings_path, contents)
+            .map_err(|error| format!("Не удалось сохранить настройки: {error}"))
+    }
+}
+
+fn current_time() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!(
+        "{:02}:{:02}:{:02}",
+        (seconds / 3600) % 24,
+        (seconds / 60) % 60,
+        seconds % 60
     )
 }
 
-fn apply_theme(ctx: &egui::Context) {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = BG;
-    v.window_fill = SURFACE;
-    v.extreme_bg_color = BG;
-    v.faint_bg_color = SURFACE;
-    v.override_text_color = Some(TEXT);
-
-    v.widgets.noninteractive.bg_fill = SURFACE;
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT2);
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
-
-    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(33, 38, 45);
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT);
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
-
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(48, 54, 61);
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TEXT);
-
-    v.widgets.active.bg_fill = ACCENT;
-    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, BG);
-
-    ctx.set_visuals(v);
+#[tauri::command]
+fn get_status(state: State<'_, AppState>) -> StatusSnapshot {
+    state.snapshot()
 }
 
-// -- Log --------------------------------------------------------------------
-
-#[derive(Clone)]
-struct LogLine {
-    ts: String,
-    msg: String,
-    err: bool,
+#[tauri::command]
+fn get_settings(state: State<'_, AppState>) -> Settings {
+    state.settings.lock().unwrap().clone()
 }
 
-fn now_ts() -> String {
-    let s = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("{:02}:{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60, s % 60)
+#[tauri::command]
+fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result<Settings, String> {
+    if state.stats.running.load(Ordering::SeqCst) {
+        return Err("Сначала выключите защиту".into());
+    }
+    if settings.port == 0 {
+        return Err("Порт должен быть от 1 до 65535".into());
+    }
+    state.persist_settings(&settings)?;
+    *state.settings.lock().unwrap() = settings.clone();
+    state.log("Настройки сохранены", false);
+    Ok(settings)
 }
 
-fn log(log: &Arc<Mutex<Vec<LogLine>>>, msg: &str, err: bool) {
-    log.lock().unwrap().push(LogLine {
-        ts: now_ts(),
-        msg: msg.into(),
-        err,
-    });
-}
-
-// -- App --------------------------------------------------------------------
-
-struct App {
-    stats: Arc<proxy::Stats>,
-    log: Arc<Mutex<Vec<LogLine>>>,
-    started_at: Option<Instant>,
-    lan_mode: bool,
-    port_str: String,
-    active_port: u16,
-}
-
-impl App {
-    fn new() -> Self {
-        Self {
-            stats: proxy::Stats::new(),
-            log: Arc::new(Mutex::new(Vec::new())),
-            started_at: None,
-            lan_mode: false,
-            port_str: proxy::DEFAULT_PORT.to_string(),
-            active_port: proxy::DEFAULT_PORT,
-        }
+#[tauri::command]
+fn start_proxy(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
+    if state.stats.running.load(Ordering::SeqCst) {
+        return Ok(state.snapshot());
     }
 
-    fn running(&self) -> bool {
-        self.stats.running.load(Ordering::SeqCst)
-    }
+    let settings = state.settings.lock().unwrap().clone();
+    state.stats.set_worker_domain(&settings.worker_domain);
+    *state.active_port.lock().unwrap() = settings.port;
+    *state.started_at.lock().unwrap() = Some(Instant::now());
+    state.log("Запускаю защищённый маршрут…", false);
 
-    fn start(&mut self) {
-        if self.running() { return; }
-
-        let port: u16 = match self.port_str.trim().parse() {
-            Ok(p) if p > 0 => p,
-            _ => {
-                log(&self.log, "Неверный порт", true);
+    let stats = state.stats.clone();
+    let logs = state.logs.clone();
+    let lan_mode = settings.lan_mode;
+    let port = settings.port;
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                push_log(&logs, format!("Не удалось запустить сервис: {error}"), true);
                 return;
             }
         };
-
-        self.active_port = port;
-        self.started_at = Some(Instant::now());
-        let stats = self.stats.clone();
-        let lg = self.log.clone();
-        let lan = self.lan_mode;
-
-        log(&lg, "Запускаю прокси...", false);
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let r = rt.block_on(proxy::run(stats, lan, port));
-            if let Err(e) = r {
-                log(&lg, &format!("Ошибка: {}", e), true);
-            }
-        });
-
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        if self.running() {
-            let addr = if lan { "0.0.0.0" } else { "127.0.0.1" };
-            log(&self.log, &format!("SOCKS5 на {}:{}", addr, port), false);
-            if lan {
-                log(&self.log, "LAN-режим: другие устройства могут подключаться", false);
-            }
+        if let Err(error) = runtime.block_on(proxy::run(stats, lan_mode, port)) {
+            push_log(&logs, format!("Ошибка подключения: {error}"), true);
         }
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(220));
+    if !state.stats.running.load(Ordering::SeqCst) {
+        *state.started_at.lock().unwrap() = None;
+        return Err(state
+            .logs
+            .lock()
+            .unwrap()
+            .last()
+            .map(|line| line.message.clone())
+            .unwrap_or_else(|| "Не удалось запустить прокси".into()));
     }
 
-    fn stop(&mut self) {
-        self.stats.running.store(false, Ordering::SeqCst);
-        self.started_at = None;
-        log(&self.log, "Остановлен", false);
-    }
-
-    fn uptime_str(&self) -> String {
-        match self.started_at {
-            Some(t) => {
-                let s = t.elapsed().as_secs();
-                format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
-            }
-            None => "--:--:--".into(),
-        }
-    }
+    state.log(
+        format!(
+            "Прокси запущен на {}:{}",
+            if settings.lan_mode {
+                "0.0.0.0"
+            } else {
+                "127.0.0.1"
+            },
+            settings.port
+        ),
+        false,
+    );
+    let host = if settings.lan_mode {
+        local_ip().unwrap_or_else(|| "127.0.0.1".into())
+    } else {
+        "127.0.0.1".into()
+    };
+    let _ = open::that(format!(
+        "tg://proxy?server={host}&port={}&secret={}",
+        settings.port,
+        state.stats.telegram_secret()
+    ));
+    state.log("Открываю подключение в Telegram…", false);
+    Ok(state.snapshot())
 }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(std::time::Duration::from_millis(300));
-
-        let on = self.running();
-        let active = self.stats.active.load(Ordering::Relaxed);
-        let total = self.stats.total.load(Ordering::Relaxed);
-        let ws = self.stats.ws.load(Ordering::Relaxed);
-        let dc = self.stats.last_dc.load(Ordering::Relaxed);
-
-        // === Ad bar (top) ===
-        egui::TopBottomPanel::top("ad").show(ctx, |ui| {
-            egui::Frame::new()
-                .fill(AD_BG)
-                .inner_margin(egui::Margin::symmetric(12, 6))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(ACCENT, egui::RichText::new("RoseVPN").size(12.0).strong());
-                        ui.colored_label(TEXT2, egui::RichText::new("Обход для всех приложений").size(11.0));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(egui::Button::new(
-                                egui::RichText::new("@rosevpnru_bot").size(11.0).strong().color(ACCENT)
-                            ).frame(false)).clicked() {
-                                let _ = open::that("https://t.me/rosevpnru_bot");
-                            }
-                        });
-                    });
-                });
-        });
-
-        // === Log (bottom) ===
-        egui::TopBottomPanel::bottom("log")
-            .min_height(120.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.colored_label(TEXT2, egui::RichText::new("LOG").size(11.0));
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for e in self.log.lock().unwrap().iter() {
-                            let c = if e.err { RED } else { TEXT2 };
-                            ui.colored_label(c, egui::RichText::new(
-                                format!("{} {}", e.ts, e.msg)
-                            ).size(11.5).monospace());
-                        }
-                    });
-            });
-
-        // === Stats bar ===
-        egui::TopBottomPanel::bottom("stats").show(ctx, |ui| {
-            egui::Frame::new()
-                .fill(SURFACE)
-                .inner_margin(egui::Margin::symmetric(16, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        stat(ui, "Соединения", &active.to_string());
-                        ui.add_space(20.0);
-                        stat(ui, "WS-туннели", &ws.to_string());
-                        ui.add_space(20.0);
-                        stat(ui, "DC", &if dc > 0 { dc.to_string() } else { "—".into() });
-                        ui.add_space(20.0);
-                        stat(ui, "Всего", &total.to_string());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            stat(ui, "Аптайм", &self.uptime_str());
-                        });
-                    });
-                });
-        });
-
-        // === Main ===
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(30.0);
-
-                // Title
-                ui.colored_label(TEXT, egui::RichText::new("TGLock").size(32.0).strong());
-                ui.add_space(4.0);
-                ui.colored_label(TEXT2, egui::RichText::new("WebSocket-туннель для Telegram").size(13.0));
-
-                ui.add_space(24.0);
-
-                // Status indicator
-                let (dot_color, status_text) = if on {
-                    (GREEN, "Подключено")
-                } else {
-                    (egui::Color32::from_rgb(80, 80, 80), "Отключено")
-                };
-
-                ui.horizontal(|ui| {
-                    let center = ui.available_width() / 2.0 - 50.0;
-                    ui.add_space(center);
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter().circle_filled(r.center(), 5.0, dot_color);
-                    ui.colored_label(
-                        if on { GREEN } else { TEXT2 },
-                        egui::RichText::new(status_text).size(14.0).strong(),
-                    );
-                });
-
-                ui.add_space(20.0);
-
-                // Options (only when stopped)
-                if !on {
-                    ui.horizontal(|ui| {
-                        let center = ui.available_width() / 2.0 - 130.0;
-                        ui.add_space(center);
-                        ui.colored_label(TEXT2, egui::RichText::new("Порт:").size(12.0));
-                        let port_edit = egui::TextEdit::singleline(&mut self.port_str)
-                            .desired_width(55.0)
-                            .font(egui::TextStyle::Monospace);
-                        ui.add(port_edit);
-                        ui.add_space(12.0);
-                        ui.checkbox(&mut self.lan_mode, "");
-                        ui.colored_label(TEXT2, egui::RichText::new("LAN").size(12.0));
-                        ui.colored_label(
-                            egui::Color32::from_rgb(80, 85, 95),
-                            egui::RichText::new("(0.0.0.0)").size(10.5),
-                        );
-                    });
-                    ui.add_space(8.0);
-                }
-
-                // Big button
-                if !on {
-                    let btn = ui.add_sized(
-                        [260.0, 52.0],
-                        egui::Button::new(
-                            egui::RichText::new("ПОДКЛЮЧИТЬ").size(18.0).strong().color(BG)
-                        ).fill(ACCENT).corner_radius(8.0),
-                    );
-                    if btn.clicked() {
-                        self.start();
-                    }
-                } else {
-                    let btn = ui.add_sized(
-                        [260.0, 52.0],
-                        egui::Button::new(
-                            egui::RichText::new("ОТКЛЮЧИТЬ").size(18.0).strong().color(TEXT)
-                        ).fill(egui::Color32::from_rgb(40, 45, 52)).corner_radius(8.0),
-                    );
-                    if btn.clicked() {
-                        self.stop();
-                    }
-                }
-
-                ui.add_space(24.0);
-
-                // Setup section
-                egui::Frame::new()
-                    .fill(SURFACE)
-                    .corner_radius(8.0)
-                    .inner_margin(16.0)
-                    .show(ui, |ui| {
-                        ui.set_width(360.0);
-
-                        ui.colored_label(TEXT, egui::RichText::new("Настройка Telegram").size(14.0).strong());
-                        ui.add_space(6.0);
-
-                        let server_addr = if self.lan_mode && on {
-                            local_ip().unwrap_or_else(|| "127.0.0.1".into())
-                        } else {
-                            "127.0.0.1".into()
-                        };
-
-                        let display_port = if on { self.active_port } else {
-                            self.port_str.trim().parse().unwrap_or(proxy::DEFAULT_PORT)
-                        };
-
-                        if on {
-                            if ui.add(egui::Button::new(
-                                egui::RichText::new("Настроить автоматически").size(13.0).color(ACCENT)
-                            ).frame(false)).clicked() {
-                                let _ = open::that(format!("tg://socks?server={}&port={}", server_addr, display_port));
-                                log(&self.log, "Открываю настройку Telegram...", false);
-                            }
-                            ui.add_space(4.0);
-                        }
-
-                        ui.colored_label(TEXT2, egui::RichText::new("Настройки → Продвинутые → Тип соединения → SOCKS5").size(11.5));
-                        ui.add_space(4.0);
-
-                        egui::Grid::new("cfg").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
-                            ui.colored_label(TEXT2, "Сервер");
-                            ui.monospace(&server_addr);
-                            ui.end_row();
-                            ui.colored_label(TEXT2, "Порт");
-                            ui.monospace(format!("{}", display_port));
-                            ui.end_row();
-                        });
-                    });
-
-                ui.add_space(16.0);
-
-                // How it works (compact)
-                ui.colored_label(TEXT2, egui::RichText::new(
-                    "Трафик Telegram → SOCKS5 → WSS → web.telegram.org → DC"
-                ).size(11.0));
-                ui.colored_label(TEXT2, egui::RichText::new(
-                    "Провайдер видит обычный HTTPS. Остальной трафик не затрагивается."
-                ).size(11.0));
-            });
-        });
-    }
+#[tauri::command]
+fn stop_proxy(state: State<'_, AppState>) -> StatusSnapshot {
+    state.stats.stop();
+    *state.started_at.lock().unwrap() = None;
+    state.log("Защита выключена", false);
+    state.snapshot()
 }
 
-fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.vertical(|ui| {
-        ui.colored_label(TEXT2, egui::RichText::new(label).size(10.0));
-        ui.colored_label(TEXT, egui::RichText::new(value).size(13.0).strong().monospace());
+fn push_log(logs: &Arc<Mutex<Vec<LogLine>>>, message: String, error: bool) {
+    logs.lock().unwrap().push(LogLine {
+        timestamp: current_time(),
+        message,
+        error,
     });
 }
 
@@ -386,4 +248,26 @@ fn local_ip() -> Option<String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+fn main() {
+    tauri::Builder::default()
+        .setup(|app| {
+            let settings_path = app
+                .path()
+                .app_config_dir()
+                .map_err(|error| error.to_string())?
+                .join("settings.json");
+            app.manage(AppState::new(settings_path));
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_status,
+            get_settings,
+            save_settings,
+            start_proxy,
+            stop_proxy
+        ])
+        .run(tauri::generate_context!())
+        .expect("failed to run TGLock");
 }

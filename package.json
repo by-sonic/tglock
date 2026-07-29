@@ -1,0 +1,20 @@
+{
+  "name": "tglock-ui",
+  "private": true,
+  "version": "2.0.0-beta.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 1420",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.2.6"
+  }
+}

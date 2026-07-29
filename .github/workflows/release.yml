@@ -2,82 +2,73 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ["v*"]
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  publish:
+    name: Build ${{ matrix.platform }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: tglock.exe
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: tglock-macos-x64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: tglock-macos-arm64
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: tglock-linux-x64
+          - platform: macOS universal
+            os: macos-14
+            args: --target universal-apple-darwin
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - platform: Windows x64
+            os: windows-latest
+            args: --target x86_64-pc-windows-msvc
+            rust-targets: x86_64-pc-windows-msvc
+          - platform: Linux x64
+            os: ubuntu-22.04
+            args: --target x86_64-unknown-linux-gnu
+            rust-targets: x86_64-unknown-linux-gnu
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust-targets }}
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Install frontend dependencies
+        run: npm ci
 
-      - name: Rename (Unix)
-        if: runner.os != 'Windows'
-        run: cp target/${{ matrix.target }}/release/tglock ${{ matrix.artifact }}
-
-      - name: Rename (Windows)
-        if: runner.os == 'Windows'
-        run: copy target\${{ matrix.target }}\release\tglock.exe ${{ matrix.artifact }}
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          tagName: v__VERSION__
+          releaseName: TGLock v__VERSION__
+          releaseBody: |
+            Новый TGLock: адаптивный MTProto/WebSocket-транспорт и полностью обновлённый интерфейс на Tauri 2.
 
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            tglock.exe/tglock.exe
-            tglock-macos-x64/tglock-macos-x64
-            tglock-macos-arm64/tglock-macos-arm64
-            tglock-linux-x64/tglock-linux-x64
-          body: |
-            ## TGLock ${{ github.ref_name }}
-
-            Обход блокировки Telegram через WebSocket-туннель. Один клик.
-
-            | Файл | Платформа |
-            |---|---|
-            | `tglock.exe` | Windows x64 |
-            | `tglock-macos-x64` | macOS Intel |
-            | `tglock-macos-arm64` | macOS Apple Silicon |
-            | `tglock-linux-x64` | Linux x64 |
-
-            **[by sonic VPN](https://t.me/bysonicvpn_bot)** — полный обход блокировок для всех приложений
+            - macOS: скачайте универсальный `.dmg` или `.app.tar.gz`
+            - Windows: скачайте `.exe` установщик
+            - Linux: скачайте `.AppImage` или `.deb`
+          releaseDraft: false
+          prerelease: true
+          args: ${{ matrix.args }}
