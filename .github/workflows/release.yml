@@ -90,14 +90,7 @@ jobs:
           test -n "$app" || { echo "TGLock.app не найден"; exit 1; }
           exe="$app/Contents/MacOS/tglock"
           test -f "$exe" || { echo "нет $exe:"; ls -la "$app/Contents/MacOS/"; exit 1; }
-          ls -la "$exe"
-          if ! grep -qa 'ipc\.localhost' "$exe"; then
-            echo "в бандле не GUI: отсутствует признак ipc.localhost"; exit 1
-          fi
-          if grep -qa 'allow-direct' "$exe"; then
-            echo "в бандле оказался headless CLI: найден признак allow-direct"; exit 1
-          fi
-          echo "OK: в бандле GUI-бинарь"
+          python3 scripts/verify_bundle_binary.py "$exe"
 
       - name: The bundled binary must actually be the GUI one
         if: runner.os == 'Linux'
@@ -109,14 +102,7 @@ jobs:
           dpkg-deb -x "$deb" "$root"
           exe="$root/usr/bin/tglock"
           test -f "$exe" || { echo "нет /usr/bin/tglock:"; dpkg-deb -c "$deb" | grep '/bin/'; exit 1; }
-          ls -la "$exe"
-          if ! grep -qa 'ipc\.localhost' "$exe"; then
-            echo "в .deb не GUI: отсутствует признак ipc.localhost"; exit 1
-          fi
-          if grep -qa 'allow-direct' "$exe"; then
-            echo "в .deb оказался headless CLI: найден признак allow-direct"; exit 1
-          fi
-          echo "OK: в .deb GUI-бинарь"
+          python3 scripts/verify_bundle_binary.py "$exe"
 
   cli:
     name: Headless CLI ${{ matrix.platform }}

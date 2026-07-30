@@ -89,15 +89,8 @@ jobs:
       - name: The bundled binary must actually be the GUI one
         run: |
           exe=$(find target -maxdepth 8 -path '*TGLock.app/Contents/MacOS/tglock' | head -1)
-          test -n "$exe" || { echo "исполняемый файл бандла не найден"; find target -name 'TGLock.app' -maxdepth 6; exit 1; }
-          ls -la "$exe"
-          if ! grep -qa 'ipc\.localhost' "$exe"; then
-            echo "в бандле не GUI: отсутствует признак ipc.localhost"; exit 1
-          fi
-          if grep -qa 'allow-direct' "$exe"; then
-            echo "в бандле оказался headless CLI: найден признак allow-direct"; exit 1
-          fi
-          echo "OK: в бандле GUI-бинарь"
+          test -n "$exe" || { echo "исполняемый файл бандла не найден"; find target -maxdepth 6 -name 'TGLock.app'; exit 1; }
+          python3 scripts/verify_bundle_binary.py "$exe"
 
   headless:
     name: Headless CLI (no WebView, no Node)
