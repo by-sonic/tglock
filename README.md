@@ -223,8 +223,6 @@ COPY . .
 RUN cargo build --release --locked --no-default-features --bin tglock-cli
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/tglock-cli /usr/local/bin/tglock-cli
 EXPOSE 1080
 ENTRYPOINT ["tglock-cli", "--lan", "--secret-file", "/data/secret"]
@@ -234,7 +232,7 @@ ENTRYPOINT ["tglock-cli", "--lan", "--secret-file", "/data/secret"]
 docker run -d --name tglock -p 1080:1080 -v tglock-data:/data tglock
 ```
 
-Образу не нужны ни Node.js, ни `libwebkit2gtk` — только `ca-certificates` для проверки сертификата Telegram.
+Образу не нужно вообще ничего: ни Node.js, ни `libwebkit2gtk`, ни даже `ca-certificates` — TLS работает на rustls, а корневые сертификаты вшиты в бинарь.
 
 ---
 
@@ -411,7 +409,7 @@ TGLock определяет Telegram по IP получателя и завор�
 | **Tauri 2** | Нативная оболочка для GUI. Опциональна: за фичей `gui`, в CLI не входит |
 | **TypeScript + Vite** | Интерфейс, внутренняя навигация и строгая типизация |
 | **tokio** | Async I/O, обработка сигналов для корректной остановки сервиса |
-| **tokio-tungstenite** | WebSocket-клиент с TLS поверх `native-tls` |
+| **tokio-tungstenite** + **rustls** | WebSocket-клиент с TLS на чистом Rust: без системного OpenSSL, кросскомпилируется под Android, корневые сертификаты вшиты |
 | **aes** + **ctr** | Расшифровка MTProto `obfuscated2` init-пакета |
 | **clap** | Разбор аргументов `tglock-cli` |
 

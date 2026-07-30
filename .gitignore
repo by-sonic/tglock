@@ -2,7 +2,26 @@
 /dist
 /dist-ui
 /node_modules
-/gen
 /tools
 *.zip
 .claude/
+
+# Сгенерированный Android-проект коммитится: в нём манифест, разрешения и
+# Kotlin-код сервиса. Игнорируются только артефакты сборки и локальные пути.
+/gen/apple
+# ACL-схемы генерируются tauri-build при каждой сборке.
+/gen/schemas
+/gen/android/.gradle
+/gen/android/.idea
+/gen/android/build
+/gen/android/app/build
+/gen/android/buildSrc/build
+/gen/android/local.properties
+/gen/android/.tauri
+/gen/android/tauri.settings.gradle
+/gen/android/app/src/main/jniLibs
+/gen/android/app/src/main/assets
+*.keystore
+*.jks
+keystore.properties
+key.properties

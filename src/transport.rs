@@ -355,6 +355,21 @@ pub fn routes_for_dc(dc: u16, media: bool) -> Vec<Route> {
     routes
 }
 
+/// Select the rustls cryptographic provider.
+///
+/// rustls 0.23 refuses to guess when the enabled features do not name exactly
+/// one provider, and the failure is a panic on the first TLS handshake — not a
+/// compile error and not something the offline tests can reach, because they use
+/// a plaintext local route. Installing it at the point of use means both
+/// frontends are covered without a startup hook.
+fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // An error here means a provider is already installed, which is fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 async fn connect_route(route: &Route) -> Result<TelegramWebSocket, String> {
     let tcp = tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -392,14 +407,16 @@ async fn connect_route(route: &Route) -> Result<TelegramWebSocket, String> {
         .map_err(|error| format!("WebSocket handshake: {}", error));
     }
 
+    ensure_crypto_provider();
+
     // The URI host remains the real Telegram hostname even when the TCP socket
-    // is opened to a pinned IP. Native TLS therefore validates Telegram's
-    // certificate and sends the correct SNI.
-    let tls = native_tls::TlsConnector::new().map_err(|error| format!("TLS setup: {}", error))?;
-    let connector = tokio_tungstenite::Connector::NativeTls(tls);
+    // is opened to a pinned IP, so TLS validates Telegram's certificate and
+    // sends the correct SNI. Passing no connector makes tokio-tungstenite build
+    // the default rustls one, with the bundled webpki root store; certificate
+    // and hostname verification are never disabled.
     tokio::time::timeout(
         CONNECT_TIMEOUT,
-        tokio_tungstenite::client_async_tls_with_config(request, tcp, None, Some(connector)),
+        tokio_tungstenite::client_async_tls_with_config(request, tcp, None, None),
     )
     .await
     .map_err(|_| "TLS/WebSocket timeout".to_owned())?
@@ -653,6 +670,17 @@ mod tests {
             candidates.last().unwrap().kind,
             RouteKind::CloudflareWorker,
             "third-party infrastructure must never be tried before Telegram itself"
+        );
+    }
+
+    #[test]
+    fn a_crypto_provider_is_available_for_tls() {
+        // Guards against the failure that compiles cleanly and passes every
+        // offline test, then panics on the first real connection to Telegram.
+        ensure_crypto_provider();
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "without an installed provider every TLS handshake panics"
         );
     }
 

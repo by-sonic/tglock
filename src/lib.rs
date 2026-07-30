@@ -9,3 +9,9 @@ pub mod config;
 pub mod mtproto;
 pub mod proxy;
 pub mod transport;
+
+/// The graphical application, shared by the desktop binary and the Android
+/// package. Compiled only with the `gui` feature, so a headless build never
+/// pulls in Tauri or a WebView.
+#[cfg(feature = "gui")]
+pub mod gui;

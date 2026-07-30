@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">"TGLock"</string>
+    <string name="main_activity_title">"TGLock"</string>
+    <string name="tunnel_channel_name">Туннель</string>
+    <string name="tunnel_channel_description">Уведомление, которое не даёт системе выгрузить туннель, пока приложение открыто</string>
+    <string name="tunnel_notification_title">TGLock активен</string>
+    <string name="tunnel_notification_text">Пока это уведомление на месте, система не выгрузит туннель</string>
+</resources>

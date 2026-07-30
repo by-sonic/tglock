@@ -9,14 +9,20 @@ autobins = false
 
 [features]
 default = ["gui"]
-# The desktop GUI. Turning it off drops Tauri, the system WebView and the
-# frontend bundle from the build, which is what makes headless servers and
-# machines without a GPU or monitor able to build and run TGLock at all.
-gui = ["dep:tauri", "dep:tauri-build", "dep:open"]
+# The graphical application, on desktop and on Android. Turning it off drops
+# Tauri, the system WebView and the frontend bundle from the build, which is
+# what makes headless servers and machines without a GPU or monitor able to
+# build and run TGLock at all.
+gui = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-opener"]
 
 [lib]
-name = "tglock"
+# Отличается от имени бинаря намеренно: одинаковые имена lib и bin дают
+# коллизию выходных файлов, которую cargo обещает сделать ошибкой.
+name = "tglock_lib"
 path = "src/lib.rs"
+# Android загружает приложение как нативную библиотеку, а не как исполняемый
+# файл, поэтому нужен cdylib. rlib остаётся для CLI и тестов.
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
 name = "tglock"
@@ -29,7 +35,8 @@ path = "src/bin/cli.rs"
 
 [dependencies]
 tauri = { version = "2", features = [], optional = true }
-open = { version = "5", optional = true }
+# Opens the tg:// link. Unlike the `open` crate this works on Android too.
+tauri-plugin-opener = { version = "2", optional = true }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -42,8 +49,19 @@ tokio = { version = "1", features = [
   "sync",
   "signal",
 ] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-native-tls = "0.2"
+# rustls вместо native-tls: на чистом Rust, поэтому кросскомпилируется под
+# Android без OpenSSL, а на Linux снимает зависимость от системного libssl.
+# webpki-roots несёт корневые сертификаты с собой, так что поведение одинаково
+# на всех платформах и не зависит от системного хранилища.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Провайдер выбирается явно: rustls 0.23 не определяет его сам, если фичи не
+# включают ровно один, и падает паникой при первом TLS-соединении. ring выбран
+# потому что кросскомпилируется под Android без внешнего тулчейна.
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+] }
 futures-util = "0.3"
 aes = "0.8"
 ctr = "0.9"
