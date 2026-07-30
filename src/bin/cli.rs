@@ -5,8 +5,6 @@
 //! GPU or monitor — the cases that make the GUI fail to start at all
 //! (by-sonic/tglock#10, by-sonic/tglock#17).
 
-mod config;
-
 use clap::Parser;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -14,6 +12,7 @@ use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use tglock::cli_settings as config;
 use tglock::{proxy, transport};
 
 const STATUS_POLL: Duration = Duration::from_secs(1);

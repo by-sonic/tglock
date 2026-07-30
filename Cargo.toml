@@ -33,7 +33,7 @@ required-features = ["gui"]
 
 [[bin]]
 name = "tglock-cli"
-path = "src/bin/cli/main.rs"
+path = "src/bin/cli.rs"
 required-features = ["cli"]
 
 [dependencies]

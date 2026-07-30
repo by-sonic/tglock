@@ -1,5 +1,9 @@
 //! Файл конфигурации для `tglock-cli`.
 //!
+//! Живёт в библиотеке, а не рядом с бинарём: каталожная форма `src/bin/cli/`
+//! ломает перечисление бинарей в Tauri — он выводит имя приложения из имени
+//! каталога и пытается упаковать несуществующий `cli`.
+//!
 //! Запрошен в by-sonic/tglock#32: держать все параметры и секрет в одном месте,
 //! чтобы не собирать батник с ключами при каждом запуске.
 //!
@@ -7,11 +11,11 @@
 //! Флаги-переключатели (`--lan`, `--allow-direct`, `--quiet`) могут только
 //! включать: их отсутствие означает «взять из файла», а не «выключить».
 
+use crate::config::ListenConfig;
+use crate::{mtproto, proxy};
 use serde::Deserialize;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use tglock::config::ListenConfig;
-use tglock::{mtproto, proxy};
 
 /// Имя файла, который ищется рядом с бинарём, если `--config` не задан.
 pub const DEFAULT_FILE_NAME: &str = "tglock.toml";

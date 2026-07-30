@@ -9,3 +9,7 @@ pub mod config;
 pub mod mtproto;
 pub mod proxy;
 pub mod transport;
+
+/// Настройки headless-версии: файл конфигурации и сведение с флагами.
+#[cfg(feature = "cli")]
+pub mod cli_settings;
