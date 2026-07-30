@@ -133,6 +133,19 @@ pub fn secret_hex(secret: &[u8; 16]) -> String {
     output
 }
 
+/// Разобрать секрет, записанный человеком.
+///
+/// Принимает и 32 hex-символа, и форму с префиксом `dd` — именно так секрет
+/// выглядит в ссылке `tg://proxy`, откуда его и копируют.
+pub fn parse_secret(value: &str) -> Option<[u8; 16]> {
+    let trimmed = value.trim();
+    let hex = trimmed
+        .strip_prefix("dd")
+        .filter(|rest| rest.len() == 32)
+        .unwrap_or(trimmed);
+    parse_secret_hex(hex)
+}
+
 fn parse_secret_hex(value: &str) -> Option<[u8; 16]> {
     if value.len() != 32 {
         return None;
@@ -498,6 +511,52 @@ mod tests {
         // misread by Telegram's frontend.
         for _ in 0..2_000 {
             assert!(!is_reserved_init(&generate_relay_init(ABRIDGED, 2)));
+        }
+    }
+
+    #[test]
+    fn accepts_a_secret_copied_from_a_tg_link() {
+        let expected = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        // Обе формы: как в файле и как в ссылке tg://proxy.
+        assert_eq!(
+            parse_secret("00112233445566778899aabbccddeeff"),
+            Some(expected)
+        );
+        assert_eq!(
+            parse_secret("dd00112233445566778899aabbccddeeff"),
+            Some(expected)
+        );
+        // Пробелы по краям — обычное дело при копировании.
+        assert_eq!(
+            parse_secret("  dd00112233445566778899aabbccddeeff\n"),
+            Some(expected)
+        );
+        // Секрет, который сам начинается с dd и уже имеет полную длину, не
+        // должен потерять первый байт: префикс снимается только если после него
+        // остаётся ровно 32 символа.
+        assert_eq!(
+            parse_secret("dd112233445566778899aabbccddeeff"),
+            Some([
+                0xdd, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_secrets() {
+        for bad in [
+            "",
+            "dd",
+            "слишком коротко",
+            "00112233445566778899aabbccddee",     // 30 символов
+            "00112233445566778899aabbccddeeffff", // 34 символа
+            "zz112233445566778899aabbccddeeff",   // не hex
+        ] {
+            assert!(parse_secret(bad).is_none(), "{bad:?} должен быть отвергнут");
         }
     }
 
