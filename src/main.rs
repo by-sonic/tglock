@@ -222,7 +222,56 @@ fn push_log(logs: &Arc<Mutex<Vec<LogLine>>>, message: String, error: bool) {
     });
 }
 
+/// Environment variables that make the WebView render without a GPU.
+///
+/// The window is never created when 3D acceleration is unavailable: no
+/// monitor, the default Microsoft display driver, a virtual machine without
+/// 3D enabled (by-sonic/tglock#10, by-sonic/tglock#17). For a small status
+/// panel software rendering costs nothing noticeable, so preferring it is the
+/// safer default.
+///
+/// Values already present in the environment are never overwritten, and
+/// `TGLOCK_FORCE_GPU` disables the whole mechanism.
+fn software_rendering_vars(
+    force_gpu: bool,
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, &'static str)> {
+    if force_gpu {
+        return Vec::new();
+    }
+
+    let candidates: &[(&str, &str)] = if cfg!(target_os = "windows") {
+        &[(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "--disable-gpu --disable-gpu-compositing",
+        )]
+    } else if cfg!(target_os = "macos") {
+        // WebKit on macOS falls back to software rendering on its own.
+        &[]
+    } else {
+        &[
+            ("WEBKIT_DISABLE_COMPOSITING_MODE", "1"),
+            ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
+        ]
+    };
+
+    candidates
+        .iter()
+        .filter(|(key, _)| !is_set(key))
+        .copied()
+        .collect()
+}
+
+fn prefer_software_rendering() {
+    let force_gpu = std::env::var_os("TGLOCK_FORCE_GPU").is_some();
+    for (key, value) in software_rendering_vars(force_gpu, |key| std::env::var_os(key).is_some()) {
+        std::env::set_var(key, value);
+    }
+}
+
 fn main() {
+    prefer_software_rendering();
+
     tauri::Builder::default()
         .setup(|app| {
             let settings_path = app
@@ -242,4 +291,51 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run TGLock");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn software_rendering_is_requested_by_default() {
+        let vars = software_rendering_vars(false, |_| false);
+        if cfg!(target_os = "macos") {
+            assert!(vars.is_empty(), "macOS needs no override");
+        } else {
+            assert!(
+                !vars.is_empty(),
+                "a machine without 3D acceleration must still get a window"
+            );
+        }
+    }
+
+    #[test]
+    fn force_gpu_disables_the_override() {
+        assert!(software_rendering_vars(true, |_| false).is_empty());
+    }
+
+    #[test]
+    fn an_operators_own_value_is_never_overwritten() {
+        assert!(software_rendering_vars(false, |_| true).is_empty());
+    }
+
+    #[test]
+    fn windows_uses_webview2_arguments_and_linux_uses_webkit_ones() {
+        let keys: Vec<_> = software_rendering_vars(false, |_| false)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        if cfg!(target_os = "windows") {
+            assert_eq!(keys, ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"]);
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(
+                keys,
+                [
+                    "WEBKIT_DISABLE_COMPOSITING_MODE",
+                    "WEBKIT_DISABLE_DMABUF_RENDERER"
+                ]
+            );
+        }
+    }
 }
