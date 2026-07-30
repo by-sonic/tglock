@@ -1,3 +1,4 @@
+use crate::config::ListenConfig;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -8,6 +9,12 @@ use tokio_tungstenite::tungstenite;
 
 pub const DEFAULT_PORT: u16 = 1080;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const INIT_LEN: usize = 64;
+const SOCKS5_VERSION: u8 = 0x05;
+/// How long to wait for a full MTProto init before treating an ambiguous first
+/// byte as the start of a SOCKS5 greeting.
+const PROTOCOL_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+const PROTOCOL_PROBE_INTERVAL: Duration = Duration::from_millis(5);
 
 pub struct Stats {
     pub running: AtomicBool,
@@ -25,6 +32,14 @@ pub struct Stats {
 
 impl Stats {
     pub fn new() -> Arc<Self> {
+        Self::with_secret(initial_secret())
+    }
+
+    /// Build with an explicit proxy secret.
+    ///
+    /// A daemon must pin this: the secret is half of the `tg://proxy` link, so
+    /// generating a fresh one on restart breaks every configured client.
+    pub fn with_secret(secret: [u8; 16]) -> Arc<Self> {
         Arc::new(Self {
             running: AtomicBool::new(false),
             active: AtomicU32::new(0),
@@ -34,7 +49,7 @@ impl Stats {
             ws_failures: AtomicU32::new(0),
             last_route: AtomicU8::new(0),
             transport: crate::transport::TransportEngine::new(),
-            secret: initial_secret(),
+            secret,
             shutdown: Mutex::new(None),
         })
     }
@@ -69,13 +84,28 @@ fn initial_secret() -> [u8; 16] {
     crate::mtproto::generate_secret()
 }
 
-pub async fn run(stats: Arc<Stats>, lan: bool, port: u16) -> Result<(), String> {
-    let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
-    let addr = format!("{}:{}", host, port);
-    let listener = TcpListener::bind(&addr)
+/// Claim the local port.
+///
+/// Separated from [`serve`] so a caller can report a port conflict before it
+/// tells the user the proxy is running.
+pub async fn bind(listen: ListenConfig) -> Result<TcpListener, String> {
+    TcpListener::bind(listen.addr)
         .await
-        .map_err(|e| format!("Port {} busy: {}", port, e))?;
+        .map_err(|error| format!("Cannot listen on {}: {}", listen.addr, error))
+}
 
+/// Bind and serve until [`Stats::stop`] is called.
+pub async fn run(stats: Arc<Stats>, listen: ListenConfig) -> Result<(), String> {
+    let listener = bind(listen).await?;
+    serve(stats, listener, listen.allow_direct).await
+}
+
+/// Accept clients on an already bound listener.
+pub async fn serve(
+    stats: Arc<Stats>,
+    listener: TcpListener,
+    allow_direct: bool,
+) -> Result<(), String> {
     stats.running.store(true, Ordering::SeqCst);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     *stats.shutdown.lock().unwrap() = Some(shutdown_tx);
@@ -90,7 +120,7 @@ pub async fn run(stats: Arc<Stats>, lan: bool, port: u16) -> Result<(), String> 
                         s.active.fetch_add(1, Ordering::Relaxed);
                         s.total.fetch_add(1, Ordering::Relaxed);
                         tasks.spawn(async move {
-                            let _ = handle(stream, &s, !lan).await;
+                            let _ = handle(stream, &s, allow_direct).await;
                             s.active.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
@@ -115,22 +145,67 @@ pub async fn run(stats: Arc<Stats>, lan: bool, port: u16) -> Result<(), String> 
 
 // -- SOCKS5 -----------------------------------------------------------------
 
+#[derive(Debug, Eq, PartialEq)]
+enum Protocol {
+    Socks5,
+    MtProto,
+    Empty,
+}
+
 async fn handle(
     s: TcpStream,
     stats: &Stats,
     allow_direct: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut first = [0; 1];
-    let peeked = tokio::time::timeout(IO_TIMEOUT, s.peek(&mut first))
+    match detect_protocol(&s, stats).await? {
+        Protocol::Socks5 => handle_socks5(s, stats, allow_direct).await,
+        Protocol::MtProto => handle_mtproto(s, stats).await,
+        Protocol::Empty => Ok(()),
+    }
+}
+
+/// Decide which protocol a fresh client is speaking without consuming anything.
+///
+/// A SOCKS5 greeting starts with `0x05` — but so does one in every 256 MTProto
+/// init packets, because the client fills those 64 bytes at random and
+/// `mtproto::is_reserved_init` only avoids `0xef`, `0xee`, `0xdd`, HTTP verbs
+/// and the TLS record header. Deciding on the first byte alone therefore sends
+/// roughly one connection in 256 down the SOCKS5 path, where it dies. From the
+/// outside that looks exactly like Telegram sending messages every other try.
+///
+/// When the first byte is ambiguous, wait briefly: a real SOCKS5 client sends a
+/// short greeting and then blocks on our reply, so only MTProto produces a full
+/// 64-byte init that decodes under our secret.
+async fn detect_protocol(
+    stream: &TcpStream,
+    stats: &Stats,
+) -> Result<Protocol, Box<dyn std::error::Error + Send + Sync>> {
+    let mut probe = [0; INIT_LEN];
+    let peeked = tokio::time::timeout(IO_TIMEOUT, stream.peek(&mut probe[..1]))
         .await
         .map_err(|_| "client protocol detection timeout")??;
     if peeked == 0 {
-        return Ok(());
+        return Ok(Protocol::Empty);
     }
-    if first[0] == 0x05 {
-        handle_socks5(s, stats, allow_direct).await
-    } else {
-        handle_mtproto(s, stats).await
+    if probe[0] != SOCKS5_VERSION {
+        return Ok(Protocol::MtProto);
+    }
+
+    let deadline = tokio::time::Instant::now() + PROTOCOL_PROBE_TIMEOUT;
+    loop {
+        if stream.peek(&mut probe).await? == INIT_LEN {
+            return Ok(
+                if crate::mtproto::parse_client_init(&probe, &stats.secret).is_some() {
+                    Protocol::MtProto
+                } else {
+                    Protocol::Socks5
+                },
+            );
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(Protocol::Socks5);
+        }
+        tokio::time::sleep(PROTOCOL_PROBE_INTERVAL).await;
     }
 }
 
@@ -397,6 +472,132 @@ async fn tcp_relay(a: TcpStream, b: TcpStream) {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// Start the proxy on a kernel-assigned port.
+    ///
+    /// Binding first and reading the port back removes the reserve-then-rebind
+    /// race that a `port 0` helper would otherwise introduce.
+    async fn start_proxy(
+        stats: Arc<Stats>,
+        allow_direct: bool,
+    ) -> (u16, tokio::task::JoinHandle<Result<(), String>>) {
+        let listener = bind(ListenConfig::loopback(0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { serve(stats, listener, allow_direct).await });
+        (port, server)
+    }
+
+    async fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+    }
+
+    /// Perform a SOCKS5 greeting, send `request`, return the 10-byte reply.
+    async fn socks5_exchange(port: u16, request: &[u8]) -> (TcpStream, [u8; 10]) {
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greeting = [0; 2];
+        client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [0x05, 0x00]);
+        client.write_all(request).await.unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        (client, reply)
+    }
+
+    fn socks5_ipv4_request(command: u8, ip: [u8; 4], port: u16) -> Vec<u8> {
+        let mut request = vec![0x05, command, 0x00, 0x01];
+        request.extend_from_slice(&ip);
+        request.extend_from_slice(&port.to_be_bytes());
+        request
+    }
+
+    /// A client init whose first byte is not the SOCKS5 version, so the test
+    /// exercises the unambiguous detection path.
+    fn unambiguous_client_init(secret: &[u8; 16], dc_index: i16) -> [u8; INIT_LEN] {
+        loop {
+            let init = crate::mtproto::test_client_init(secret, dc_index);
+            if init[0] != SOCKS5_VERSION {
+                return init;
+            }
+        }
+    }
+
+    fn ambiguous_client_init(secret: &[u8; 16], dc_index: i16) -> [u8; INIT_LEN] {
+        loop {
+            let init = crate::mtproto::test_client_init(secret, dc_index);
+            if init[0] == SOCKS5_VERSION {
+                return init;
+            }
+        }
+    }
+
+    /// Stand-in for `kwsN.web.telegram.org`: a plaintext WebSocket that behaves
+    /// like an obfuscated2 relay.
+    ///
+    /// Returns the raw init frame it was handed and the plaintext it recovered,
+    /// so a test can assert on what Telegram would really have seen.
+    // The handshake callback's error type is tungstenite's own `ErrorResponse`,
+    // whose size is not ours to change.
+    #[allow(clippy::result_large_err)]
+    async fn mock_relay(
+        listener: TcpListener,
+        response: Vec<u8>,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (tcp, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        // Telegram confirms the `binary` subprotocol the proxy asks for, and
+        // tungstenite refuses a handshake that silently drops it. A mock that
+        // does not answer it would only ever test the failure path.
+        let mut websocket =
+            tokio_tungstenite::accept_hdr_async(tcp, |_: &Request, mut response: Response| {
+                response.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    "binary".parse().expect("static header value"),
+                );
+                Ok(response)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let init = match websocket.next().await {
+            Some(Ok(Message::Binary(data))) => data,
+            other => return Err(format!("expected an init frame, got {other:?}")),
+        };
+        let header: [u8; INIT_LEN] = init
+            .as_slice()
+            .try_into()
+            .map_err(|_| format!("init frame is {} bytes, not {INIT_LEN}", init.len()))?;
+        let mut relay = crate::mtproto::test_relay_peer(&header);
+
+        let mut request = Vec::new();
+        while request.is_empty() {
+            match websocket.next().await {
+                Some(Ok(Message::Binary(mut data))) => {
+                    relay.decrypt(&mut data);
+                    request.extend_from_slice(&data);
+                }
+                Some(Ok(_)) => {}
+                _ => break,
+            }
+        }
+
+        let mut wire = response;
+        relay.encrypt(&mut wire);
+        websocket
+            .send(Message::Binary(wire))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((init, request))
+    }
 
     #[tokio::test]
     async fn parses_fragmented_ipv4_socks5_handshake() {
@@ -451,7 +652,8 @@ mod tests {
 
         let stats = Stats::new();
         let server_stats = stats.clone();
-        let server = tokio::spawn(async move { run(server_stats, false, port).await });
+        let server =
+            tokio::spawn(async move { run(server_stats, ListenConfig::loopback(port)).await });
 
         tokio::time::timeout(Duration::from_secs(2), async {
             while !stats.running.load(Ordering::SeqCst) {
@@ -471,6 +673,263 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parses_domain_and_ipv6_socks5_targets() {
+        let domain = "web.telegram.org";
+        let mut domain_payload = vec![u8::try_from(domain.len()).unwrap()];
+        domain_payload.extend_from_slice(domain.as_bytes());
+
+        for (address_type, payload, expected) in
+            [(0x03_u8, domain_payload, domain), (0x04, vec![0; 16], "::")]
+        {
+            let (mut client, mut server) = tokio::io::duplex(256);
+            let task = tokio::spawn(async move { read_socks5_request(&mut server).await.unwrap() });
+
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut greeting = [0; 2];
+            client.read_exact(&mut greeting).await.unwrap();
+
+            let mut request = vec![0x05, 0x01, 0x00, address_type];
+            request.extend_from_slice(&payload);
+            request.extend_from_slice(&443_u16.to_be_bytes());
+            client.write_all(&request).await.unwrap();
+
+            assert_eq!(task.await.unwrap(), (expected.to_owned(), 443));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_and_unsupported_socks5_requests() {
+        // (request after the greeting, expected reply status, why)
+        let cases: [(Vec<u8>, Option<u8>, &str); 5] = [
+            (
+                vec![0x05, 0x03, 0x00, 0x01, 1, 1, 1, 1, 0x01, 0xbb],
+                Some(0x07),
+                "UDP ASSOCIATE is not implemented, so it must be refused rather than half-served",
+            ),
+            (
+                vec![0x05, 0x02, 0x00, 0x01, 1, 1, 1, 1, 0x01, 0xbb],
+                Some(0x07),
+                "BIND is not implemented",
+            ),
+            (
+                vec![0x05, 0x01, 0x00, 0x09, 1, 1, 1, 1, 0x01, 0xbb],
+                Some(0x08),
+                "unknown address type",
+            ),
+            (
+                vec![0x05, 0x01, 0x00, 0x03, 0x00, 0x01, 0xbb],
+                None,
+                "empty domain",
+            ),
+            (
+                vec![0x04, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0x01, 0xbb],
+                None,
+                "wrong protocol version in the request",
+            ),
+        ];
+
+        for (request, expected_status, reason) in cases {
+            let (mut client, mut server) = tokio::io::duplex(256);
+            let task = tokio::spawn(async move { read_socks5_request(&mut server).await.is_err() });
+
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut greeting = [0; 2];
+            client.read_exact(&mut greeting).await.unwrap();
+            client.write_all(&request).await.unwrap();
+
+            if let Some(status) = expected_status {
+                let mut reply = [0; 10];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply[0], 0x05, "{reason}");
+                assert_eq!(reply[1], status, "{reason}");
+            }
+            assert!(task.await.unwrap(), "{reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reports_a_busy_port_instead_of_pretending_to_run() {
+        let taken = bind(ListenConfig::loopback(0)).await.unwrap();
+        let port = taken.local_addr().unwrap().port();
+
+        let error = bind(ListenConfig::loopback(port)).await.unwrap_err();
+        assert!(
+            error.contains(&port.to_string()),
+            "the error must name the port that is busy, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mtproto_init_beginning_with_the_socks5_version_is_not_misrouted() {
+        // One init in 256 starts with 0x05. Routing it to the SOCKS5 handler is
+        // what makes Telegram work only every other attempt.
+        let stats = Stats::new();
+        let init = ambiguous_client_init(&stats.secret, 2);
+        let (port, server) = start_proxy(stats.clone(), true).await;
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(&init).await.unwrap();
+
+        // Detection must land on MTProto, which records the data centre. The
+        // SOCKS5 path would instead answer with a handshake reply.
+        wait_until("the MTProto data centre to be recorded", || {
+            stats.last_dc.load(Ordering::Relaxed) == 2
+        })
+        .await;
+
+        stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fragmented_socks5_greeting_is_still_detected() {
+        let stats = Stats::new();
+        let (port, server) = start_proxy(stats.clone(), true).await;
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // Byte-at-a-time, the way a small greeting can actually arrive.
+        for byte in [0x05, 0x01, 0x00] {
+            client.write_all(&[byte]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let mut greeting = [0; 2];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut greeting))
+            .await
+            .expect("the proxy must answer the greeting")
+            .unwrap();
+        assert_eq!(greeting, [0x05, 0x00]);
+
+        stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_listener_refuses_non_telegram_destinations() {
+        let stats = Stats::new();
+        let (port, server) = start_proxy(stats.clone(), false).await;
+
+        let (_client, reply) =
+            socks5_exchange(port, &socks5_ipv4_request(0x01, [1, 1, 1, 1], 443)).await;
+        assert_eq!(
+            reply[1], 0x02,
+            "a shared listener must not relay arbitrary destinations"
+        );
+
+        stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_relays_direct_destinations() {
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = echo.accept().await.unwrap();
+            let mut buffer = [0; 5];
+            stream.read_exact(&mut buffer).await.unwrap();
+            stream.write_all(&buffer).await.unwrap();
+        });
+
+        let stats = Stats::new();
+        let (port, server) = start_proxy(stats.clone(), true).await;
+
+        let (mut client, reply) =
+            socks5_exchange(port, &socks5_ipv4_request(0x01, [127, 0, 0, 1], echo_port)).await;
+        assert_eq!(reply[1], 0x00);
+
+        client.write_all(b"hello").await.unwrap();
+        let mut echoed = [0; 5];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"hello");
+
+        stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tunnels_mtproto_through_a_websocket_relay() {
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = relay_listener.local_addr().unwrap().port();
+        let response = b"a reply that only Telegram could have sent".to_vec();
+        let relay = tokio::spawn(mock_relay(relay_listener, response.clone()));
+
+        let stats = Stats::new();
+        stats.transport.force_local_route(relay_port);
+        let (port, server) = start_proxy(stats.clone(), false).await;
+
+        let init = unambiguous_client_init(&stats.secret, -4);
+        let mut peer = crate::mtproto::test_client_peer(&init, &stats.secret);
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(&init).await.unwrap();
+
+        let request = b"a request that must reach Telegram unchanged".to_vec();
+        let mut wire = request.clone();
+        peer.encrypt(&mut wire);
+        client.write_all(&wire).await.unwrap();
+
+        let mut received = vec![0; response.len()];
+        tokio::time::timeout(Duration::from_secs(10), client.read_exact(&mut received))
+            .await
+            .expect("the relay's answer must come back through the tunnel")
+            .unwrap();
+        peer.decrypt(&mut received);
+        assert_eq!(
+            received, response,
+            "the client must see Telegram's plaintext"
+        );
+
+        let (init_frame, relayed) = relay.await.unwrap().unwrap();
+        assert_eq!(init_frame.len(), INIT_LEN);
+        assert_ne!(
+            init_frame.as_slice(),
+            init.as_slice(),
+            "the upstream init must be freshly generated, not the client's own"
+        );
+        assert_eq!(
+            relayed, request,
+            "Telegram must receive exactly the client's plaintext"
+        );
+
+        assert_eq!(stats.last_dc.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            stats.last_route.load(Ordering::Relaxed),
+            crate::transport::RouteKind::TelegramIp.ui_code()
+        );
+        assert_eq!(stats.ws_failures.load(Ordering::Relaxed), 0);
+
+        stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn counts_a_failure_when_no_route_answers() {
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+
+        let stats = Stats::new();
+        stats.transport.force_local_route(dead_port);
+        let (port, server) = start_proxy(stats.clone(), false).await;
+
+        let init = unambiguous_client_init(&stats.secret, 2);
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(&init).await.unwrap();
+
+        wait_until("the failed tunnel to be counted", || {
+            stats.ws_failures.load(Ordering::Relaxed) > 0
+        })
+        .await;
+        assert_eq!(
+            stats.last_route.load(Ordering::Relaxed),
+            0,
+            "a route must not be reported as working when every attempt failed"
+        );
+        assert_eq!(stats.ws.load(Ordering::Relaxed), 0);
+
+        stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "requires live Telegram network access"]
     async fn accepts_mtproto_and_builds_live_media_tunnel() {
         let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -479,7 +938,8 @@ mod tests {
 
         let stats = Stats::new();
         let server_stats = stats.clone();
-        let server = tokio::spawn(async move { run(server_stats, false, port).await });
+        let server =
+            tokio::spawn(async move { run(server_stats, ListenConfig::loopback(port)).await });
         while !stats.running.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }

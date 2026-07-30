@@ -1,15 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod mtproto;
-mod proxy;
-mod transport;
-
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Manager, State};
+use tglock::config::ListenConfig;
+use tglock::{proxy, transport};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,11 +88,7 @@ impl AppState {
 
     fn snapshot(&self) -> StatusSnapshot {
         let data_center = self.stats.last_dc.load(Ordering::Relaxed);
-        let route = match self.stats.last_route.load(Ordering::Relaxed) {
-            1 => "Telegram WebSocket",
-            2 => "Cloudflare Worker",
-            _ => "Автоматический маршрут",
-        };
+        let route = transport::route_label(self.stats.last_route.load(Ordering::Relaxed));
         StatusSnapshot {
             running: self.stats.running.load(Ordering::SeqCst),
             active_connections: self.stats.active.load(Ordering::Relaxed),
@@ -173,10 +167,14 @@ fn start_proxy(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
     *state.started_at.lock().unwrap() = Some(Instant::now());
     state.log("Запускаю защищённый маршрут…", false);
 
+    let listen = if settings.lan_mode {
+        ListenConfig::lan(settings.port)
+    } else {
+        ListenConfig::loopback(settings.port)
+    };
+
     let stats = state.stats.clone();
     let logs = state.logs.clone();
-    let lan_mode = settings.lan_mode;
-    let port = settings.port;
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime,
@@ -185,7 +183,7 @@ fn start_proxy(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
                 return;
             }
         };
-        if let Err(error) = runtime.block_on(proxy::run(stats, lan_mode, port)) {
+        if let Err(error) = runtime.block_on(proxy::run(stats, listen)) {
             push_log(&logs, format!("Ошибка подключения: {error}"), true);
         }
     });
@@ -202,28 +200,8 @@ fn start_proxy(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
             .unwrap_or_else(|| "Не удалось запустить прокси".into()));
     }
 
-    state.log(
-        format!(
-            "Прокси запущен на {}:{}",
-            if settings.lan_mode {
-                "0.0.0.0"
-            } else {
-                "127.0.0.1"
-            },
-            settings.port
-        ),
-        false,
-    );
-    let host = if settings.lan_mode {
-        local_ip().unwrap_or_else(|| "127.0.0.1".into())
-    } else {
-        "127.0.0.1".into()
-    };
-    let _ = open::that(format!(
-        "tg://proxy?server={host}&port={}&secret={}",
-        settings.port,
-        state.stats.telegram_secret()
-    ));
+    state.log(format!("Прокси запущен на {}", listen.addr), false);
+    let _ = open::that(listen.telegram_link(&state.stats.telegram_secret()));
     state.log("Открываю подключение в Telegram…", false);
     Ok(state.snapshot())
 }
@@ -242,12 +220,6 @@ fn push_log(logs: &Arc<Mutex<Vec<LogLine>>>, message: String, error: bool) {
         message,
         error,
     });
-}
-
-fn local_ip() -> Option<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    Some(socket.local_addr().ok()?.ip().to_string())
 }
 
 fn main() {

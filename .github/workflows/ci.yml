@@ -38,6 +38,49 @@ jobs:
       - name: Test
         run: cargo test --all-targets
 
+  headless:
+    name: Headless CLI (no WebView, no Node)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # This job deliberately installs no Node.js, no frontend and no
+      # libwebkit2gtk. It fails the moment anything drags the GUI back into the
+      # headless build, which is the whole point of issues #10 and #17.
+      - name: Lint
+        run: cargo clippy --no-default-features --lib --bins --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --no-default-features --lib --bins
+
+      - name: Build
+        run: cargo build --release --no-default-features --bin tglock-cli
+
+      - name: Start, advertise a proxy link and stop on SIGTERM
+        run: |
+          ./target/release/tglock-cli --help
+          ./target/release/tglock-cli --version
+          # --preserve-status makes this assert the shutdown path: a handled
+          # SIGTERM exits 0, an unhandled one would surface as 143 and fail.
+          timeout --preserve-status --signal=TERM 5 \
+            ./target/release/tglock-cli --port 18080 --secret-file "$PWD/secret" > cli.log 2>&1
+          cat cli.log
+          grep -q 'tg://proxy' cli.log
+          grep -q '127.0.0.1:18080' cli.log
+          test "$(stat -c '%a' "$PWD/secret")" = 600
+
+      - name: Keep the same proxy link across a restart
+        run: |
+          first=$(grep -o 'secret=[0-9a-f]*' cli.log)
+          timeout --preserve-status --signal=TERM 5 \
+            ./target/release/tglock-cli --port 18080 --secret-file "$PWD/secret" > restart.log 2>&1
+          test "$first" = "$(grep -o 'secret=[0-9a-f]*' restart.log)"
+
   msrv:
     name: Rust 1.88 compatibility
     runs-on: macos-latest
@@ -58,6 +101,9 @@ jobs:
 
       - name: Check locked dependency graph
         run: cargo check --locked
+
+      - name: Check the headless dependency graph too
+        run: cargo check --locked --no-default-features --lib --bins
 
   frontend:
     name: Frontend

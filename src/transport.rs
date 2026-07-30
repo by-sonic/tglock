@@ -9,6 +9,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(30);
 const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+const HTTPS_PORT: u16 = 443;
 
 pub type TelegramWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -29,6 +30,34 @@ impl RouteKind {
             Self::CloudflareWorker => 4,
         }
     }
+
+    pub fn from_ui_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::TelegramIp),
+            2 => Some(Self::AlternateTelegramIp),
+            3 => Some(Self::SystemDns),
+            4 => Some(Self::CloudflareWorker),
+            _ => None,
+        }
+    }
+
+    /// Human-readable name of the route, shown by both frontends.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TelegramIp => "Telegram IP",
+            Self::AlternateTelegramIp => "Запасной Telegram IP",
+            Self::SystemDns => "Системный DNS",
+            Self::CloudflareWorker => "Cloudflare Worker",
+        }
+    }
+}
+
+/// Label for a route code as stored in `Stats::last_route`.
+///
+/// Code `0` means no tunnel has been established yet, which must never be
+/// reported as a working route.
+pub fn route_label(ui_code: u8) -> &'static str {
+    RouteKind::from_ui_code(ui_code).map_or("Маршрут ещё не выбран", RouteKind::label)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -37,6 +66,24 @@ pub struct Route {
     pub websocket_host: String,
     pub path: String,
     pub kind: RouteKind,
+    /// TCP port to dial. Always 443 for Telegram and for Cloudflare Workers.
+    pub port: u16,
+    /// Wrap the connection in TLS. Always true outside tests.
+    pub secure: bool,
+}
+
+impl Route {
+    /// A production route: TLS on 443.
+    fn https(connect_host: String, websocket_host: String, path: String, kind: RouteKind) -> Self {
+        Self {
+            connect_host,
+            websocket_host,
+            path,
+            kind,
+            port: HTTPS_PORT,
+            secure: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +113,24 @@ struct HealthState {
 pub struct TransportEngine {
     health: Mutex<HealthState>,
     worker_domains: Mutex<Vec<String>>,
+    #[cfg(test)]
+    forced_routes: Mutex<Vec<Route>>,
+}
+
+#[cfg(test)]
+impl TransportEngine {
+    /// Point every data centre at a local plaintext WebSocket server so the
+    /// whole tunnel can be exercised without reaching Telegram.
+    pub(crate) fn force_local_route(&self, port: u16) {
+        *self.forced_routes.lock().unwrap() = vec![Route {
+            connect_host: "127.0.0.1".to_owned(),
+            websocket_host: format!("127.0.0.1:{}", port),
+            path: "/apiws".to_owned(),
+            kind: RouteKind::TelegramIp,
+            port,
+            secure: false,
+        }];
+    }
 }
 
 impl TransportEngine {
@@ -159,17 +224,25 @@ impl TransportEngine {
     }
 
     fn routes_for_key(&self, key: DcKey) -> Vec<Route> {
+        #[cfg(test)]
+        {
+            let forced = self.forced_routes.lock().unwrap();
+            if !forced.is_empty() {
+                return forced.clone();
+            }
+        }
+
         let mut routes = routes_for_dc(key.dc, key.media);
         let Some(destination) = telegram_ips(key.dc).first() else {
             return routes;
         };
         for domain in self.worker_domains.lock().unwrap().iter() {
-            routes.push(Route {
-                connect_host: domain.clone(),
-                websocket_host: domain.clone(),
-                path: format!("/apiws?dst={}&dc={}", destination, key.dc),
-                kind: RouteKind::CloudflareWorker,
-            });
+            routes.push(Route::https(
+                domain.clone(),
+                domain.clone(),
+                format!("/apiws?dst={}&dc={}", destination, key.dc),
+                RouteKind::CloudflareWorker,
+            ));
         }
         routes
     }
@@ -234,23 +307,23 @@ pub fn routes_for_dc(dc: u16, media: bool) -> Vec<Route> {
 
     for websocket_host in &websocket_hosts {
         for (index, ip) in ips.iter().enumerate() {
-            routes.push(Route {
-                connect_host: (*ip).to_owned(),
-                websocket_host: websocket_host.clone(),
-                path: "/apiws".to_owned(),
-                kind: if index == 0 {
+            routes.push(Route::https(
+                (*ip).to_owned(),
+                websocket_host.clone(),
+                "/apiws".to_owned(),
+                if index == 0 {
                     RouteKind::TelegramIp
                 } else {
                     RouteKind::AlternateTelegramIp
                 },
-            });
+            ));
         }
-        routes.push(Route {
-            connect_host: websocket_host.clone(),
-            websocket_host: websocket_host.clone(),
-            path: "/apiws".to_owned(),
-            kind: RouteKind::SystemDns,
-        });
+        routes.push(Route::https(
+            websocket_host.clone(),
+            websocket_host.clone(),
+            "/apiws".to_owned(),
+            RouteKind::SystemDns,
+        ));
     }
     routes
 }
@@ -258,7 +331,7 @@ pub fn routes_for_dc(dc: u16, media: bool) -> Vec<Route> {
 async fn connect_route(route: &Route) -> Result<TelegramWebSocket, String> {
     let tcp = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        TcpStream::connect((route.connect_host.as_str(), 443)),
+        TcpStream::connect((route.connect_host.as_str(), route.port)),
     )
     .await
     .map_err(|_| "TCP connect timeout".to_owned())?
@@ -266,7 +339,8 @@ async fn connect_route(route: &Route) -> Result<TelegramWebSocket, String> {
     tcp.set_nodelay(true)
         .map_err(|error| format!("TCP_NODELAY: {}", error))?;
 
-    let url = format!("wss://{}{}", route.websocket_host, route.path);
+    let scheme = if route.secure { "wss" } else { "ws" };
+    let url = format!("{}://{}{}", scheme, route.websocket_host, route.path);
     let mut request = url
         .as_str()
         .into_client_request()
@@ -277,6 +351,19 @@ async fn connect_route(route: &Route) -> Result<TelegramWebSocket, String> {
             .parse()
             .map_err(|error| format!("WebSocket protocol header: {}", error))?,
     );
+
+    if !route.secure {
+        // Only reachable from tests, which run a local WebSocket server without
+        // a certificate. Production routes are always built by `Route::https`.
+        return tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(tcp)),
+        )
+        .await
+        .map_err(|_| "WebSocket timeout".to_owned())?
+        .map(|(websocket, _)| websocket)
+        .map_err(|error| format!("WebSocket handshake: {}", error));
+    }
 
     // The URI host remains the real Telegram hostname even when the TCP socket
     // is opened to a pinned IP. Native TLS therefore validates Telegram's
@@ -371,6 +458,202 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn every_production_route_is_tls_on_443() {
+        let engine = TransportEngine::new();
+        engine.set_worker_domains(&["fallback.workers.dev".to_owned()]);
+        for dc in [1, 2, 3, 4, 5, 203] {
+            for media in [false, true] {
+                let routes = engine.routes_for_key(DcKey { dc, media });
+                assert!(!routes.is_empty(), "DC{dc} must have at least one route");
+                for route in routes {
+                    assert_eq!(route.port, 443, "{route:?}");
+                    assert!(route.secure, "{route:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_data_center_offers_a_pinned_ip_and_a_dns_route() {
+        for dc in [1, 2, 3, 4, 5, 203] {
+            let routes = routes_for_dc(dc, false);
+            assert!(
+                routes
+                    .iter()
+                    .any(|route| route.kind == RouteKind::TelegramIp),
+                "DC{dc} must keep a pinned-IP route so a poisoned DNS answer is survivable"
+            );
+            assert!(
+                routes
+                    .iter()
+                    .any(|route| route.kind == RouteKind::SystemDns),
+                "DC{dc} must keep a DNS route so a stale pinned IP is survivable"
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_grows_with_each_failure_and_stops_at_the_ceiling() {
+        let engine = TransportEngine::new();
+        let route = routes_for_dc(2, false)[0].clone();
+
+        // 30s doubling per failure, flattening at the 30-minute ceiling.
+        let expected_seconds = [30, 60, 120, 240, 480, 960, 1800, 1800, 1800, 1800];
+        for (index, expected) in expected_seconds.iter().enumerate() {
+            let attempt = u32::try_from(index).unwrap() + 1;
+            let before = Instant::now();
+            engine.record_failure(&route);
+
+            let health = engine.health.lock().unwrap();
+            let entry = health.routes.get(&route).unwrap();
+            assert_eq!(entry.failures, attempt);
+            assert_eq!(
+                entry.retry_at.saturating_duration_since(before).as_secs(),
+                *expected,
+                "attempt {attempt} must wait {expected}s"
+            );
+        }
+        assert_eq!(
+            *expected_seconds.last().unwrap(),
+            FAILURE_BACKOFF_MAX.as_secs(),
+            "the schedule must flatten at the declared ceiling"
+        );
+    }
+
+    #[test]
+    fn success_clears_the_penalty_accumulated_by_failures() {
+        let engine = TransportEngine::new();
+        let key = DcKey {
+            dc: 2,
+            media: false,
+        };
+        let route = routes_for_dc(2, false)[0].clone();
+
+        engine.record_failure(&route);
+        engine.record_failure(&route);
+        assert!(!engine.ordered_candidates(key).contains(&route));
+
+        engine.record_success(key, &route);
+        assert!(!engine.health.lock().unwrap().routes.contains_key(&route));
+        assert_eq!(engine.ordered_candidates(key)[0], route);
+    }
+
+    #[test]
+    fn all_routes_cooling_down_still_yields_the_soonest_retry() {
+        let engine = TransportEngine::new();
+        let key = DcKey {
+            dc: 5,
+            media: false,
+        };
+        let routes = routes_for_dc(5, false);
+
+        // Fail the first route once and the rest twice, so the first one is the
+        // one that becomes available again soonest.
+        engine.record_failure(&routes[0]);
+        for route in &routes[1..] {
+            engine.record_failure(route);
+            engine.record_failure(route);
+        }
+
+        let candidates = engine.ordered_candidates(key);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "a fully cooling table must offer exactly one retry, not give up"
+        );
+        assert_eq!(candidates[0], routes[0]);
+    }
+
+    #[test]
+    fn worker_domains_are_rejected_unless_they_are_plain_hostnames() {
+        let engine = TransportEngine::new();
+        engine.set_worker_domains(&[
+            "https://scheme.workers.dev".to_owned(),
+            "with.a/path".to_owned(),
+            "no-dot".to_owned(),
+            "-leading.workers.dev".to_owned(),
+            "trailing-.workers.dev".to_owned(),
+            "under_score.workers.dev".to_owned(),
+            "spaces here.dev".to_owned(),
+            String::new(),
+            "good.workers.dev".to_owned(),
+        ]);
+
+        let workers: Vec<_> = engine
+            .routes_for_key(DcKey {
+                dc: 2,
+                media: false,
+            })
+            .into_iter()
+            .filter(|route| route.kind == RouteKind::CloudflareWorker)
+            .collect();
+        assert_eq!(workers.len(), 1, "only the valid hostname may survive");
+        assert_eq!(workers[0].websocket_host, "good.workers.dev");
+    }
+
+    #[test]
+    fn worker_domains_are_replaced_not_appended() {
+        let engine = TransportEngine::new();
+        let key = DcKey {
+            dc: 2,
+            media: false,
+        };
+        engine.set_worker_domains(&["first.workers.dev".to_owned()]);
+        engine.set_worker_domains(&["second.workers.dev".to_owned()]);
+
+        let workers: Vec<_> = engine
+            .routes_for_key(key)
+            .into_iter()
+            .filter(|route| route.kind == RouteKind::CloudflareWorker)
+            .collect();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].websocket_host, "second.workers.dev");
+    }
+
+    #[test]
+    fn worker_is_the_last_resort() {
+        let engine = TransportEngine::new();
+        engine.set_worker_domains(&["fallback.workers.dev".to_owned()]);
+        let key = DcKey {
+            dc: 2,
+            media: false,
+        };
+        let candidates = engine.ordered_candidates(key);
+        assert_eq!(
+            candidates.last().unwrap().kind,
+            RouteKind::CloudflareWorker,
+            "third-party infrastructure must never be tried before Telegram itself"
+        );
+    }
+
+    #[test]
+    fn route_codes_and_labels_round_trip() {
+        for kind in [
+            RouteKind::TelegramIp,
+            RouteKind::AlternateTelegramIp,
+            RouteKind::SystemDns,
+            RouteKind::CloudflareWorker,
+        ] {
+            assert_eq!(RouteKind::from_ui_code(kind.ui_code()), Some(kind));
+            assert_eq!(route_label(kind.ui_code()), kind.label());
+        }
+    }
+
+    #[test]
+    fn code_zero_is_never_reported_as_a_working_route() {
+        assert_eq!(RouteKind::from_ui_code(0), None);
+        assert_eq!(RouteKind::from_ui_code(9), None);
+        for kind in [
+            RouteKind::TelegramIp,
+            RouteKind::AlternateTelegramIp,
+            RouteKind::SystemDns,
+            RouteKind::CloudflareWorker,
+        ] {
+            assert_ne!(route_label(0), kind.label());
+        }
     }
 
     #[tokio::test]
