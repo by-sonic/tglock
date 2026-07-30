@@ -70,6 +70,75 @@ jobs:
             - macOS: скачайте универсальный `.dmg` или `.app.tar.gz`
             - Windows: скачайте `.exe` установщик
             - Linux: скачайте `.AppImage` или `.deb`
+            - Сервер или машина без монитора: скачайте `tglock-cli-*` — там нет графического интерфейса
           releaseDraft: false
           prerelease: true
           args: ${{ matrix.args }}
+
+  cli:
+    name: Headless CLI ${{ matrix.platform }}
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS universal
+            os: macos-14
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            asset: tglock-cli-universal-apple-darwin
+          - platform: Windows x64
+            os: windows-latest
+            rust-targets: x86_64-pc-windows-msvc
+            asset: tglock-cli-x86_64-pc-windows-msvc.exe
+          - platform: Linux x64
+            os: ubuntu-22.04
+            rust-targets: x86_64-unknown-linux-gnu
+            asset: tglock-cli-x86_64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # No Node.js and no desktop libraries: the CLI must build without them.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Build (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          IFS=',' read -ra targets <<< "${{ matrix.rust-targets }}"
+          binaries=()
+          for target in "${targets[@]}"; do
+            cargo build --release --locked --no-default-features \
+              --bin tglock-cli --target "$target"
+            binaries+=("target/$target/release/tglock-cli")
+          done
+          if [ "${#binaries[@]}" -gt 1 ]; then
+            lipo -create -output "${{ matrix.asset }}" "${binaries[@]}"
+          else
+            cp "${binaries[0]}" "${{ matrix.asset }}"
+          fi
+          chmod +x "${{ matrix.asset }}"
+          ./"${{ matrix.asset }}" --version
+
+      - name: Build (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release --locked --no-default-features \
+            --bin tglock-cli --target ${{ matrix.rust-targets }}
+          cp "target/${{ matrix.rust-targets }}/release/tglock-cli.exe" "${{ matrix.asset }}"
+          ./"${{ matrix.asset }}" --version
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: true
+          files: ${{ matrix.asset }}

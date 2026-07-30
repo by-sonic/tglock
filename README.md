@@ -79,6 +79,9 @@ TGLock — это **локальный SOCKS5-прокси** на твоём к�
 | **Windows 10/11** (x64) | `.exe` installer | |
 | **macOS** (Apple Silicon + Intel) | universal `.dmg` | |
 | **Linux** (x86_64) | `.AppImage` / `.deb` | |
+| **Сервер / без монитора** (любая ОС) | `tglock-cli-*` | |
+
+> **🖥 `tglock-cli`** — тот же туннель без графического интерфейса, одним бинарём. Нужен, если окно не создаётся: сервер, контейнер, виртуалка, машина без монитора или без 3D-ускорения. Подробности — [ниже](#-без-графического-интерфейса-tglock-cli).
 
 > **🍎 macOS:** пока сборка не нотарифицирована Apple, при первом запуске может понадобиться:
 > ```bash
@@ -107,6 +110,81 @@ Telegram → Настройки → **Продвинутые** → Тип сое
 В окне TGLock включи галочку **LAN** — приложение начнёт слушать на `0.0.0.0`. Все устройства в твоей домашней сети (телефон, планшет, ноутбук, телевизор) смогут подключиться к `<твой-IP>:1080` и тоже получить рабочий Telegram. IP отобразится прямо в интерфейсе TGLock — копируй и вписывай в настройки Telegram на остальных устройствах.
 
 Удобно, если дома один комп всегда включён — он становится «домашним Telegram-роутером».
+
+### 🖥 Без графического интерфейса: `tglock-cli`
+
+Для сервера, виртуалки, контейнера и машины без монитора или без 3D-ускорения. Это отдельный бинарь, в котором **нет ни Tauri, ни системного WebView** — там, где окно просто не создаётся, CLI работает.
+
+```bash
+tglock-cli                                # 127.0.0.1:1080, только для этого компьютера
+tglock-cli --lan                           # 0.0.0.0:1080, только адреса Telegram
+tglock-cli --bind 10.0.0.5 --port 1443     # свой адрес и порт
+tglock-cli --worker my-name.workers.dev    # резервный маршрут через свой Cloudflare Worker
+tglock-cli --help                          # все флаги
+```
+
+При запуске печатается готовая `tg://proxy`-ссылка — её можно открыть на любом устройстве в сети, чтобы Telegram настроился сам. Дальше в лог идёт по строке на каждое изменение состояния: сколько соединений, какой дата-центр, какой маршрут живой, сколько сбоев.
+
+Прав администратора не нужно: TGLock не правит ни системный DNS, ни файл `hosts` — нужные адреса Telegram зашиты в маршрутах, а TLS SNI остаётся настоящим.
+
+`--lan` и любой другой сетевой адрес пропускают **только** адреса Telegram. Обычным SOCKS5-прокси TGLock становится исключительно по явному `--allow-direct`, и на сетевом адресе это открытый прокси для всего интернета — включайте осознанно.
+
+#### Юнит для systemd
+
+```ini
+[Unit]
+Description=TGLock — Telegram через WebSocket-туннель
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/tglock-cli --lan --secret-file /var/lib/tglock/secret
+Restart=on-failure
+RestartSec=5s
+StateDirectory=tglock
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo install -m755 tglock-cli-x86_64-unknown-linux-gnu /usr/local/bin/tglock-cli
+sudo systemctl enable --now tglock
+journalctl -u tglock -f
+```
+
+`--secret-file` здесь обязателен, и это не украшение: секрет — половина `tg://proxy`-ссылки. Без файла он генерируется заново при каждом старте, и после первого же `systemctl restart` все настроенные клиенты перестанут подключаться. `StateDirectory=tglock` создаёт `/var/lib/tglock` с нужными правами, а сам файл пишется с режимом `600`.
+
+Остановка по `systemctl stop` приходит как `SIGTERM` — CLI закрывает туннели и выходит с нулевым кодом, а не умирает по `SIGKILL`.
+
+#### Docker
+
+```dockerfile
+FROM rust:1.88 AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked --no-default-features --bin tglock-cli
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/tglock-cli /usr/local/bin/tglock-cli
+EXPOSE 1080
+ENTRYPOINT ["tglock-cli", "--lan", "--secret-file", "/data/secret"]
+```
+
+```bash
+docker run -d --name tglock -p 1080:1080 -v tglock-data:/data tglock
+```
+
+Образу не нужны ни Node.js, ни `libwebkit2gtk` — только `ca-certificates` для проверки сертификата Telegram.
 
 ---
 
@@ -262,7 +340,17 @@ npm ci
 npm run tauri build
 ```
 
-Результат — `target/release/tglock` (или `tglock.exe` на Windows). Требуется Rust **stable 1.75+**.
+Результат — `target/release/tglock` (или `tglock.exe` на Windows).
+
+Минимальная версия Rust — **1.88** (`rust-version` в `Cargo.toml`, проверяется отдельной задачей в CI). На более старых тулчейнах зависимости не соберутся: часть из них требует edition 2024.
+
+### Только CLI, без графики
+
+```bash
+cargo build --release --locked --no-default-features --bin tglock-cli
+```
+
+Ни Node.js, ни фронтенда, ни `libwebkit2gtk` для этого не нужно — при выключенной фиче `gui` Tauri и системный WebView в сборку не попадают вообще. Именно так CLI собирается на голом сервере.
 
 ### Кросс-компиляция через GitHub Actions
 

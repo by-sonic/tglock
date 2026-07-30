@@ -2,6 +2,7 @@ use aes::Aes256;
 use cipher::{KeyIvInit, StreamCipher};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
+use std::path::Path;
 #[cfg(not(test))]
 use std::path::PathBuf;
 
@@ -50,12 +51,13 @@ pub fn generate_secret() -> [u8; 16] {
     secret
 }
 
-#[cfg(not(test))]
-pub fn load_or_create_secret() -> [u8; 16] {
-    let Some(path) = secret_path() else {
-        return generate_secret();
-    };
-    if let Ok(value) = std::fs::read_to_string(&path) {
+/// Reuse the secret stored at `path`, creating it if it is missing or unusable.
+///
+/// A daemon needs this: the secret is half of the `tg://proxy` link, so a
+/// service that invents a new one on every restart silently invalidates every
+/// client that was already configured.
+pub fn load_or_create_secret_at(path: &Path) -> [u8; 16] {
+    if let Ok(value) = std::fs::read_to_string(path) {
         if let Some(secret) = parse_secret_hex(value.trim()) {
             return secret;
         }
@@ -65,8 +67,16 @@ pub fn load_or_create_secret() -> [u8; 16] {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    write_secret_file(&path, &secret_hex(&secret));
+    write_secret_file(path, &secret_hex(&secret));
     secret
+}
+
+#[cfg(not(test))]
+pub fn load_or_create_secret() -> [u8; 16] {
+    match secret_path() {
+        Some(path) => load_or_create_secret_at(&path),
+        None => generate_secret(),
+    }
 }
 
 #[cfg(not(test))]
@@ -94,8 +104,8 @@ fn secret_path() -> Option<PathBuf> {
     }
 }
 
-#[cfg(all(not(test), unix))]
-fn write_secret_file(path: &std::path::Path, value: &str) {
+#[cfg(unix)]
+fn write_secret_file(path: &Path, value: &str) {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -109,8 +119,8 @@ fn write_secret_file(path: &std::path::Path, value: &str) {
     }
 }
 
-#[cfg(all(not(test), not(unix)))]
-fn write_secret_file(path: &std::path::Path, value: &str) {
+#[cfg(not(unix))]
+fn write_secret_file(path: &Path, value: &str) {
     let _ = std::fs::write(path, value);
 }
 
@@ -255,6 +265,66 @@ pub(crate) fn test_client_init(secret: &[u8; 16], dc_index: i16) -> [u8; INIT_LE
     tests::generate_client_init(secret, PADDED_INTERMEDIATE, dc_index)
 }
 
+/// One end of an obfuscated2 stream, built the way the real peer builds it.
+///
+/// Lets tests assert on the bytes the peer actually observes rather than on the
+/// proxy's own view of them, so a mistake that is symmetric inside
+/// [`CryptoContext`] still fails the test.
+#[cfg(test)]
+pub(crate) struct TestPeer {
+    encrypt: AesCtr,
+    decrypt: AesCtr,
+}
+
+#[cfg(test)]
+impl TestPeer {
+    pub(crate) fn encrypt(&mut self, data: &mut [u8]) {
+        self.encrypt.apply_keystream(data);
+    }
+
+    pub(crate) fn decrypt(&mut self, data: &mut [u8]) {
+        self.decrypt.apply_keystream(data);
+    }
+}
+
+/// The Telegram client: its keys come from the init it sent, salted with the
+/// shared secret.
+#[cfg(test)]
+pub(crate) fn test_client_peer(init: &[u8; INIT_LEN], secret: &[u8; 16]) -> TestPeer {
+    let key = secret_key(&init[KEY_START..KEY_END], secret);
+    let iv: [u8; 16] = init[KEY_END..IV_END].try_into().unwrap();
+    let mut encrypt = AesCtr::new((&key).into(), (&iv).into());
+    encrypt.apply_keystream(&mut [0; INIT_LEN]);
+
+    let reversed: Vec<u8> = init[KEY_START..IV_END].iter().rev().copied().collect();
+    let decrypt_key = secret_key(&reversed[..32], secret);
+    let decrypt_iv: [u8; 16] = reversed[32..].try_into().unwrap();
+    let decrypt = AesCtr::new((&decrypt_key).into(), (&decrypt_iv).into());
+
+    TestPeer { encrypt, decrypt }
+}
+
+/// The Telegram relay: no shared secret, keys come straight from the init the
+/// proxy generated for it.
+#[cfg(test)]
+pub(crate) fn test_relay_peer(relay_init: &[u8; INIT_LEN]) -> TestPeer {
+    let key: [u8; 32] = relay_init[KEY_START..KEY_END].try_into().unwrap();
+    let iv: [u8; 16] = relay_init[KEY_END..IV_END].try_into().unwrap();
+    let mut decrypt = AesCtr::new((&key).into(), (&iv).into());
+    decrypt.apply_keystream(&mut [0; INIT_LEN]);
+
+    let reversed: Vec<u8> = relay_init[KEY_START..IV_END]
+        .iter()
+        .rev()
+        .copied()
+        .collect();
+    let encrypt_key: [u8; 32] = reversed[..32].try_into().unwrap();
+    let encrypt_iv: [u8; 16] = reversed[32..].try_into().unwrap();
+    let encrypt = AesCtr::new((&encrypt_key).into(), (&encrypt_iv).into());
+
+    TestPeer { encrypt, decrypt }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +372,133 @@ mod tests {
             telegram_secret(&[0xab; 16]),
             "ddabababababababababababababababab"
         );
+    }
+
+    #[test]
+    fn accepts_every_supported_protocol_tag() {
+        let secret = [7; 16];
+        for tag in [ABRIDGED, INTERMEDIATE, PADDED_INTERMEDIATE] {
+            let init = generate_client_init(&secret, tag, 2);
+            let parsed = parse_client_init(&init, &secret)
+                .unwrap_or_else(|| panic!("tag {tag:02x?} must be accepted"));
+            assert_eq!(parsed.dc, 2);
+            assert!(!parsed.media);
+        }
+    }
+
+    #[test]
+    fn relay_init_carries_the_clients_protocol_tag_and_dc() {
+        let secret = [3; 16];
+        for (tag, dc_index) in [
+            (ABRIDGED, 1_i16),
+            (INTERMEDIATE, -5),
+            (PADDED_INTERMEDIATE, 203),
+        ] {
+            let init = generate_client_init(&secret, tag, dc_index);
+            let parsed = parse_client_init(&init, &secret).unwrap();
+
+            // The relay init is freshly generated, never the client's bytes.
+            assert_ne!(parsed.relay_init, init);
+
+            // Decoding the relay init the way Telegram does must recover the
+            // same protocol and data centre the client asked for.
+            let key: [u8; 32] = parsed.relay_init[KEY_START..KEY_END].try_into().unwrap();
+            let iv: [u8; 16] = parsed.relay_init[KEY_END..IV_END].try_into().unwrap();
+            let mut cipher = AesCtr::new((&key).into(), (&iv).into());
+            let mut decoded = parsed.relay_init;
+            cipher.apply_keystream(&mut decoded);
+
+            assert_eq!(decoded[TAG_START..DC_START], tag);
+            assert_eq!(
+                i16::from_le_bytes([decoded[DC_START], decoded[DC_START + 1]]),
+                dc_index
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_data_centers_outside_the_known_range() {
+        let secret = [11; 16];
+        for dc_index in [0_i16, 6, -6, 204, -204, 1000] {
+            let init = generate_client_init(&secret, INTERMEDIATE, dc_index);
+            assert!(
+                parse_client_init(&init, &secret).is_none(),
+                "DC index {dc_index} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_index_marks_media_and_keeps_the_data_center() {
+        let secret = [13; 16];
+        for dc in [1_u16, 2, 3, 4, 5, 203] {
+            let index = -(dc as i16);
+            let parsed =
+                parse_client_init(&generate_client_init(&secret, ABRIDGED, index), &secret)
+                    .unwrap();
+            assert_eq!(parsed.dc, dc);
+            assert!(parsed.media);
+
+            let parsed =
+                parse_client_init(&generate_client_init(&secret, ABRIDGED, dc as i16), &secret)
+                    .unwrap();
+            assert_eq!(parsed.dc, dc);
+            assert!(!parsed.media);
+        }
+    }
+
+    #[test]
+    fn plaintext_survives_the_trip_to_the_relay_and_back() {
+        let secret = [42; 16];
+        let init = generate_client_init(&secret, ABRIDGED, 2);
+        let mut parsed = parse_client_init(&init, &secret).unwrap();
+        let mut client = test_client_peer(&init, &secret);
+        let mut relay = test_relay_peer(&parsed.relay_init);
+
+        let request = b"exactly what Telegram must receive".to_vec();
+        let mut wire = request.clone();
+        client.encrypt(&mut wire);
+        assert_ne!(wire, request, "the wire must not carry plaintext");
+        parsed.crypto.client_to_telegram(&mut wire);
+        assert_ne!(wire, request, "the upstream wire must not carry plaintext");
+        relay.decrypt(&mut wire);
+        assert_eq!(wire, request);
+
+        let response = b"exactly what the client must receive".to_vec();
+        let mut wire = response.clone();
+        relay.encrypt(&mut wire);
+        parsed.crypto.telegram_to_client(&mut wire);
+        client.decrypt(&mut wire);
+        assert_eq!(wire, response);
+    }
+
+    #[test]
+    fn keystream_advances_across_chunks() {
+        let secret = [5; 16];
+        let init = generate_client_init(&secret, INTERMEDIATE, 3);
+        let mut parsed = parse_client_init(&init, &secret).unwrap();
+        let mut client = test_client_peer(&init, &secret);
+        let mut relay = test_relay_peer(&parsed.relay_init);
+
+        // A stream cipher is only correct if both ends stay in lockstep across
+        // arbitrary chunk boundaries, which is how TCP actually delivers data.
+        let chunks: [&[u8]; 4] = [b"one", b"", b"the third chunk is longer", b"4"];
+        for chunk in chunks {
+            let mut wire = chunk.to_vec();
+            client.encrypt(&mut wire);
+            parsed.crypto.client_to_telegram(&mut wire);
+            relay.decrypt(&mut wire);
+            assert_eq!(wire, chunk);
+        }
+    }
+
+    #[test]
+    fn reserved_prefixes_never_leave_the_generator() {
+        // A relay init that starts with an HTTP verb or a protocol tag would be
+        // misread by Telegram's frontend.
+        for _ in 0..2_000 {
+            assert!(!is_reserved_init(&generate_relay_init(ABRIDGED, 2)));
+        }
     }
 
     #[test]
