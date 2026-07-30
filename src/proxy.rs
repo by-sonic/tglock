@@ -242,11 +242,9 @@ async fn handle_socks5(
         });
 
         stats.last_dc.store(dc, Ordering::Relaxed);
-        stats.ws.fetch_add(1, Ordering::Relaxed);
 
         let r = ws_tunnel(s, dc, media, &init, None, stats).await;
 
-        stats.ws.fetch_sub(1, Ordering::Relaxed);
         if r.is_err() {
             stats.ws_failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -274,7 +272,6 @@ async fn handle_mtproto(
         .ok_or("invalid MTProto init or secret")?;
 
     stats.last_dc.store(parsed.dc, Ordering::Relaxed);
-    stats.ws.fetch_add(1, Ordering::Relaxed);
     let result = ws_tunnel(
         stream,
         parsed.dc,
@@ -284,7 +281,6 @@ async fn handle_mtproto(
         stats,
     )
     .await;
-    stats.ws.fetch_sub(1, Ordering::Relaxed);
     if result.is_err() {
         stats.ws_failures.fetch_add(1, Ordering::Relaxed);
     }
@@ -401,6 +397,28 @@ fn dc_from_ip(ip: Ipv4Addr) -> Option<u16> {
 
 // -- WebSocket tunnel -------------------------------------------------------
 
+/// Keeps `Stats::ws` equal to the number of *established* tunnels.
+///
+/// Counting attempts instead would let the interface announce «Telegram на
+/// связи» while the WebSocket handshake is still failing over between routes,
+/// which takes seconds per route. Reporting a working tunnel that does not
+/// exist yet is the whole reason users saw «прокси подключён, а Telegram не
+/// работает».
+struct EstablishedTunnel<'a>(&'a Stats);
+
+impl<'a> EstablishedTunnel<'a> {
+    fn new(stats: &'a Stats) -> Self {
+        stats.ws.fetch_add(1, Ordering::Relaxed);
+        Self(stats)
+    }
+}
+
+impl Drop for EstablishedTunnel<'_> {
+    fn drop(&mut self) {
+        self.0.ws.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn ws_tunnel(
     tcp: TcpStream,
     dc: u16,
@@ -412,6 +430,7 @@ async fn ws_tunnel(
     use futures_util::{SinkExt, StreamExt};
 
     let (mut ws, connected) = stats.transport.connect(dc, media).await?;
+    let _tunnel = EstablishedTunnel::new(stats);
     stats
         .last_route
         .store(connected.route.kind.ui_code(), Ordering::Relaxed);
@@ -897,6 +916,48 @@ mod tests {
         assert_eq!(stats.ws_failures.load(Ordering::Relaxed), 0);
 
         stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_counts_only_after_the_handshake_succeeds() {
+        // Accepts TCP and then stays silent, so the WebSocket handshake never
+        // completes: the proxy is mid-attempt and no tunnel exists.
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = silent.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let accepted = silent.accept().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(accepted);
+        });
+
+        let stats = Stats::new();
+        stats.transport.force_local_route(relay_port);
+        let (port, server) = start_proxy(stats.clone(), false).await;
+
+        let init = unambiguous_client_init(&stats.secret, 2);
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(&init).await.unwrap();
+
+        wait_until("the init to be parsed", || {
+            stats.last_dc.load(Ordering::Relaxed) == 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            stats.ws.load(Ordering::Relaxed),
+            0,
+            "a handshake still in flight must not be reported as a working tunnel"
+        );
+        assert_eq!(
+            stats.last_route.load(Ordering::Relaxed),
+            0,
+            "no route may be announced before a tunnel is established"
+        );
+
+        stats.stop();
+        held.abort();
         let _ = server.await.unwrap();
     }
 
