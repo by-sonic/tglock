@@ -122,7 +122,7 @@ TGLock — это **локальный прокси** на твоём компь
 3. **Собрать самому.** Для CLI это одна команда и никаких зависимостей кроме Rust:
 
    ```bash
-   cargo build --release --locked --no-default-features --bin tglock-cli
+   cargo build --release --locked --no-default-features --features cli --bin tglock-cli
    ```
 
    Полная сборка с интерфейсом — [ниже](#-сборка-из-исходников).
@@ -220,7 +220,7 @@ journalctl -u tglock -f
 FROM rust:1.88 AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked --no-default-features --bin tglock-cli
+RUN cargo build --release --locked --no-default-features --features cli --bin tglock-cli
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
@@ -435,7 +435,7 @@ npm run tauri build
 ### Только CLI, без графики
 
 ```bash
-cargo build --release --locked --no-default-features --bin tglock-cli
+cargo build --release --locked --no-default-features --features cli --bin tglock-cli
 ```
 
 Ни Node.js, ни фронтенда, ни `libwebkit2gtk` для этого не нужно — при выключенной фиче `gui` Tauri и системный WebView в сборку не попадают вообще. Именно так CLI собирается на голом сервере.
@@ -445,9 +445,9 @@ cargo build --release --locked --no-default-features --bin tglock-cli
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo clippy --no-default-features --lib --bins --all-targets -- -D warnings
+cargo clippy --no-default-features --features cli --all-targets -- -D warnings
 cargo test --all-targets
-cargo test --no-default-features --lib --bins
+cargo test --no-default-features --features cli --lib --bins
 ```
 
 Тестов 59: разбор `obfuscated2`, каскад маршрутов и его cooldown, протокольные отказы SOCKS5, устойчивость секрета к перезапуску, плюс сквозной тест туннеля против мок-сервера, который реализует сторону Telegram и проверяет, что до неё доходит ровно тот открытый текст, который отправил клиент. Единственный тест с пометкой `#[ignore]` — тот, что требует живой сети.

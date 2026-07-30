@@ -75,28 +75,48 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
-      # Смотрит внутрь собранного бандла. v2.0.0-beta.2 опубликовался с зелёным
-      # CI, хотя .app и .deb содержали headless CLI вместо приложения: сборка
-      # была успешной, просто никто не проверял, что внутри.
-      - name: The bundle must contain the GUI binary
+      # Проверяет СОДЕРЖИМОЕ упакованного бинаря, а не его имя.
+      #
+      # v2.0.0-beta.2 и v2.0.0-beta.3 опубликовались с зелёным CI, хотя в бандле
+      # лежал headless CLI вместо приложения. В beta.3 имя файла было уже
+      # правильным — переименованным — поэтому проверка имени прошла. Отличить
+      # можно только по содержимому: `wry`/`ipc.localhost` есть исключительно в
+      # GUI, а `allow-direct` — исключительно в CLI.
+      - name: The bundled binary must actually be the GUI one
         if: runner.os == 'macOS'
         shell: bash
         run: |
           app=$(find target -maxdepth 6 -name 'TGLock.app' -type d | head -1)
           test -n "$app" || { echo "TGLock.app не найден"; exit 1; }
-          exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
-          echo "CFBundleExecutable = $exe"
-          test "$exe" = "tglock" || { echo "в бандле не GUI-бинарь"; exit 1; }
-          test -x "$app/Contents/MacOS/tglock" || { echo "исполняемый файл отсутствует"; exit 1; }
+          exe="$app/Contents/MacOS/tglock"
+          test -f "$exe" || { echo "нет $exe:"; ls -la "$app/Contents/MacOS/"; exit 1; }
+          ls -la "$exe"
+          if ! grep -qa 'ipc\.localhost' "$exe"; then
+            echo "в бандле не GUI: отсутствует признак ipc.localhost"; exit 1
+          fi
+          if grep -qa 'allow-direct' "$exe"; then
+            echo "в бандле оказался headless CLI: найден признак allow-direct"; exit 1
+          fi
+          echo "OK: в бандле GUI-бинарь"
 
-      - name: The bundle must contain the GUI binary
+      - name: The bundled binary must actually be the GUI one
         if: runner.os == 'Linux'
         shell: bash
         run: |
           deb=$(find target -maxdepth 6 -name '*.deb' | head -1)
           test -n "$deb" || { echo ".deb не найден"; exit 1; }
-          dpkg-deb -c "$deb" | grep -E ' \./usr/bin/tglock$' \
-            || { echo "в .deb нет /usr/bin/tglock:"; dpkg-deb -c "$deb" | grep '/bin/'; exit 1; }
+          root=$(mktemp -d)
+          dpkg-deb -x "$deb" "$root"
+          exe="$root/usr/bin/tglock"
+          test -f "$exe" || { echo "нет /usr/bin/tglock:"; dpkg-deb -c "$deb" | grep '/bin/'; exit 1; }
+          ls -la "$exe"
+          if ! grep -qa 'ipc\.localhost' "$exe"; then
+            echo "в .deb не GUI: отсутствует признак ipc.localhost"; exit 1
+          fi
+          if grep -qa 'allow-direct' "$exe"; then
+            echo "в .deb оказался headless CLI: найден признак allow-direct"; exit 1
+          fi
+          echo "OK: в .deb GUI-бинарь"
 
   cli:
     name: Headless CLI ${{ matrix.platform }}
@@ -136,7 +156,7 @@ jobs:
           IFS=',' read -ra targets <<< "${{ matrix.rust-targets }}"
           binaries=()
           for target in "${targets[@]}"; do
-            cargo build --release --locked --no-default-features \
+            cargo build --release --locked --no-default-features --features cli \
               --bin tglock-cli --target "$target"
             binaries+=("target/$target/release/tglock-cli")
           done
@@ -152,7 +172,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          cargo build --release --locked --no-default-features \
+          cargo build --release --locked --no-default-features --features cli \
             --bin tglock-cli --target ${{ matrix.rust-targets }}
           cp "target/${{ matrix.rust-targets }}/release/tglock-cli.exe" "${{ matrix.asset }}"
           ./"${{ matrix.asset }}" --version
