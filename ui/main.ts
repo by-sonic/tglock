@@ -35,7 +35,7 @@ let status: Status = {
   activeConnections: 0,
   tunnels: 0,
   dataCenter: null,
-  route: "Автоматический маршрут",
+  route: "Маршрут ещё не выбран",
   failures: 0,
   uptimeSeconds: 0,
   port: 1080,
