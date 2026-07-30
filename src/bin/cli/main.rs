@@ -5,6 +5,8 @@
 //! GPU or monitor — the cases that make the GUI fail to start at all
 //! (by-sonic/tglock#10, by-sonic/tglock#17).
 
+mod config;
+
 use clap::Parser;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -12,10 +14,20 @@ use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tglock::config::ListenConfig;
-use tglock::{mtproto, proxy, transport};
+use tglock::{proxy, transport};
 
 const STATUS_POLL: Duration = Duration::from_secs(1);
+
+/// Напечатать строку, вернув `false`, если stdout больше не принимает данные.
+///
+/// `println!` при ошибке записи паникует, а у демона stdout исчезает штатно: его
+/// пускают в `head`, закрывают терминал, перезапускают сборщик логов. Падать из
+/// за этого туннель не должен — он продолжает работать молча.
+fn say(text: &str) -> bool {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{text}").and_then(|()| out.flush()).is_ok()
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,13 +36,17 @@ const STATUS_POLL: Duration = Duration::from_secs(1);
     about = "TGLock без графического интерфейса: локальный MTProto-прокси через WebSocket"
 )]
 struct Args {
-    /// Адрес для прослушивания. 127.0.0.1 — только этот компьютер
-    #[arg(short, long, value_name = "IP", default_value = "127.0.0.1")]
-    bind: IpAddr,
+    /// Файл настроек. Если не задан, ищется tglock.toml рядом с бинарём
+    #[arg(short, long, value_name = "PATH")]
+    config: Option<PathBuf>,
 
-    /// Порт локального прокси
-    #[arg(short, long, value_name = "PORT", default_value_t = proxy::DEFAULT_PORT)]
-    port: u16,
+    /// Адрес для прослушивания. По умолчанию 127.0.0.1 — только этот компьютер
+    #[arg(short, long, value_name = "IP")]
+    bind: Option<IpAddr>,
+
+    /// Порт локального прокси. По умолчанию 1080
+    #[arg(short, long, value_name = "PORT")]
+    port: Option<u16>,
 
     /// То же, что --bind 0.0.0.0: доступ с других устройств в локальной сети
     #[arg(long, conflicts_with = "bind")]
@@ -44,8 +60,8 @@ struct Args {
     #[arg(long)]
     allow_direct: bool,
 
-    /// Файл с секретом прокси. Обязателен для сервиса: иначе после перезапуска
-    /// секрет будет новым и уже настроенные клиенты перестанут подключаться
+    /// Файл с секретом прокси. Для сервиса нужен он или secret в настройках:
+    /// иначе после перезапуска секрет будет новым и настроенные клиенты отвалятся
     #[arg(long, value_name = "PATH")]
     secret_file: Option<PathBuf>,
 
@@ -55,28 +71,31 @@ struct Args {
 }
 
 impl Args {
-    fn stats(&self) -> Arc<proxy::Stats> {
-        match &self.secret_file {
-            Some(path) => proxy::Stats::with_secret(mtproto::load_or_create_secret_at(path)),
-            None => proxy::Stats::new(),
+    fn overrides(&self) -> config::Overrides {
+        config::Overrides {
+            bind: self.bind,
+            port: self.port,
+            lan: self.lan,
+            allow_direct: self.allow_direct,
+            worker: self.worker.clone(),
+            secret_file: self.secret_file.clone(),
+            quiet: self.quiet,
         }
     }
 
-    fn listen(&self) -> ListenConfig {
-        let base = if self.lan {
-            ListenConfig::lan(self.port)
-        } else {
-            ListenConfig::new(self.bind, self.port)
-        };
-        if self.allow_direct {
-            base.with_allow_direct(true)
-        } else {
-            base
+    /// Файл настроек и путь, по которому он найден.
+    ///
+    /// Явный `--config` обязателен к существованию: если человек указал путь и
+    /// опечатался, молча стартовать с настройками по умолчанию — худшее из
+    /// возможных поведений.
+    fn load_file(&self) -> Result<(config::FileConfig, Option<PathBuf>), String> {
+        if let Some(path) = &self.config {
+            return Ok((config::FileConfig::load(path)?, Some(path.clone())));
         }
-    }
-
-    fn worker_domains(&self) -> String {
-        self.worker.join(",")
+        match config::path_next_to_executable() {
+            Some(path) if path.is_file() => Ok((config::FileConfig::load(&path)?, Some(path))),
+            _ => Ok((config::FileConfig::default(), None)),
+        }
     }
 }
 
@@ -100,30 +119,46 @@ fn main() -> ExitCode {
 }
 
 async fn serve(args: Args) -> Result<(), String> {
-    let listen = args.listen();
-    let stats = args.stats();
-    stats.set_worker_domain(&args.worker_domains());
+    let (file, file_path) = args.load_file()?;
+    let settings = config::resolve(file, args.overrides())?;
+    let listen = settings.listen;
+    let stats = settings.stats();
+    let quiet = settings.quiet;
 
     // Bind before printing anything: a busy port must be an error, not a
     // daemon that reports success and silently does nothing.
     let listener = proxy::bind(listen).await?;
 
-    if !args.quiet {
-        println!("Слушаю {}", listen.addr);
-        println!(
+    if !quiet {
+        let intro = match &file_path {
+            Some(path) => format!("Настройки: {}", path.display()),
+            None => format!(
+                "Настройки: только флаги ({} рядом с бинарём не найден)",
+                config::DEFAULT_FILE_NAME
+            ),
+        };
+        say(&intro);
+        say(&format!("Слушаю {}", listen.addr));
+        say(&format!(
             "Ссылка для Telegram: {}",
             listen.telegram_link(&stats.telegram_secret())
-        );
-        if listen.allow_direct && !listen.addr.ip().is_loopback() {
-            println!(
-                "Внимание: --allow-direct на адресе {} превращает TGLock в открытый SOCKS5-прокси",
-                listen.addr.ip()
+        ));
+        if matches!(settings.secret, config::SecretSource::Ephemeral) {
+            say(
+                "Внимание: секрет не закреплён и будет новым после перезапуска — \
+                 задайте secret в настройках или --secret-file",
             );
-        } else if !listen.allow_direct {
-            println!("Пропускаю только адреса Telegram");
         }
-        if !args.worker.is_empty() {
-            println!("Резервные Worker-домены: {}", args.worker_domains());
+        if listen.allow_direct && !listen.addr.ip().is_loopback() {
+            say(&format!(
+                "Внимание: allow_direct на адресе {} превращает TGLock в открытый SOCKS5-прокси",
+                listen.addr.ip()
+            ));
+        } else if !listen.allow_direct {
+            say("Пропускаю только адреса Telegram");
+        }
+        if !settings.workers.is_empty() {
+            say(&format!("Резервные Worker-домены: {}", settings.workers));
         }
     }
 
@@ -132,14 +167,14 @@ async fn serve(args: Args) -> Result<(), String> {
         tokio::spawn(
             async move { proxy::serve(server_stats, listener, listen.allow_direct).await },
         );
-    let watcher = (!args.quiet).then(|| tokio::spawn(watch_status(stats.clone())));
+    let watcher = (!quiet).then(|| tokio::spawn(watch_status(stats.clone())));
 
     let outcome = tokio::select! {
         joined = &mut server => joined.map_err(|error| format!("рабочая задача упала: {error}"))?,
         signal = shutdown_signal() => {
             signal.map_err(|error| format!("обработчик сигналов: {error}"))?;
-            if !args.quiet {
-                println!("Получен сигнал остановки, закрываю соединения…");
+            if !quiet {
+                say("Получен сигнал остановки, закрываю соединения…");
             }
             stats.stop();
             server
@@ -173,7 +208,7 @@ async fn watch_status(stats: Arc<proxy::Stats>) {
             continue;
         }
         let (active, tunnels, dc, route, failures) = current;
-        println!(
+        let line = format!(
             "соединений {active} · туннелей {tunnels} · {} · {} · сбоев {failures}",
             if dc > 0 {
                 format!("DC{dc}")
@@ -182,6 +217,11 @@ async fn watch_status(stats: Arc<proxy::Stats>) {
             },
             transport::route_label(route)
         );
+        // Закрытый stdout — не ошибка: печатать больше некому, туннель работает
+        // дальше без наблюдателя.
+        if !say(&line) {
+            return;
+        }
         previous = Some(current);
     }
 }
@@ -213,6 +253,11 @@ mod tests {
         Args::try_parse_from(std::iter::once("tglock-cli").chain(args.iter().copied())).unwrap()
     }
 
+    /// Итоговые настройки только из флагов, без файла.
+    fn from_flags(args: &[&str]) -> config::Resolved {
+        config::resolve(config::FileConfig::default(), parse(args).overrides()).unwrap()
+    }
+
     #[test]
     fn command_definition_is_valid() {
         Args::command().debug_assert();
@@ -220,7 +265,7 @@ mod tests {
 
     #[test]
     fn defaults_to_loopback_on_the_default_port() {
-        let listen = parse(&[]).listen();
+        let listen = from_flags(&[]).listen;
         assert_eq!(listen.addr.to_string(), "127.0.0.1:1080");
         assert!(listen.allow_direct);
     }
@@ -228,50 +273,50 @@ mod tests {
     #[test]
     fn lan_flag_matches_explicit_wildcard_bind() {
         assert_eq!(
-            parse(&["--lan"]).listen(),
-            parse(&["-b", "0.0.0.0"]).listen()
+            from_flags(&["--lan"]).listen,
+            from_flags(&["-b", "0.0.0.0"]).listen
         );
     }
 
     #[test]
     fn lan_does_not_relay_non_telegram_traffic() {
-        let listen = parse(&["--lan"]).listen();
+        let listen = from_flags(&["--lan"]).listen;
         assert_eq!(listen.addr.to_string(), "0.0.0.0:1080");
         assert!(!listen.allow_direct);
     }
 
     #[test]
     fn allow_direct_is_the_only_way_to_open_a_network_listener() {
-        assert!(!parse(&["-b", "192.168.1.10"]).listen().allow_direct);
+        assert!(!from_flags(&["-b", "192.168.1.10"]).listen.allow_direct);
         assert!(
-            parse(&["-b", "192.168.1.10", "--allow-direct"])
-                .listen()
+            from_flags(&["-b", "192.168.1.10", "--allow-direct"])
+                .listen
                 .allow_direct
         );
     }
 
     #[test]
     fn bind_and_port_are_honoured() {
-        let listen = parse(&["--bind", "10.0.0.7", "--port", "1443"]).listen();
+        let listen = from_flags(&["--bind", "10.0.0.7", "--port", "1443"]).listen;
         assert_eq!(listen.addr.to_string(), "10.0.0.7:1443");
     }
 
     #[test]
     fn ipv6_bind_is_accepted() {
-        let listen = parse(&["-b", "::1", "-p", "2080"]).listen();
+        let listen = from_flags(&["-b", "::1", "-p", "2080"]).listen;
         assert_eq!(listen.addr.to_string(), "[::1]:2080");
         assert!(listen.allow_direct);
     }
 
     #[test]
     fn repeated_worker_flags_collapse_into_one_list() {
-        let args = parse(&["--worker", "a.workers.dev", "--worker", "b.workers.dev"]);
-        assert_eq!(args.worker_domains(), "a.workers.dev,b.workers.dev");
+        let settings = from_flags(&["--worker", "a.workers.dev", "--worker", "b.workers.dev"]);
+        assert_eq!(settings.workers, "a.workers.dev,b.workers.dev");
     }
 
     #[test]
     fn no_worker_flag_means_no_domains() {
-        assert!(parse(&[]).worker_domains().is_empty());
+        assert!(from_flags(&[]).workers.is_empty());
     }
 
     #[test]
@@ -288,10 +333,10 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
 
-        let first = parse(&["--secret-file", path.to_str().unwrap()])
+        let first = from_flags(&["--secret-file", path.to_str().unwrap()])
             .stats()
             .telegram_secret();
-        let second = parse(&["--secret-file", path.to_str().unwrap()])
+        let second = from_flags(&["--secret-file", path.to_str().unwrap()])
             .stats()
             .telegram_secret();
 
@@ -303,11 +348,11 @@ mod tests {
 
         // A corrupted file must not wedge the daemon: it is replaced.
         std::fs::write(&path, "garbage").unwrap();
-        let third = parse(&["--secret-file", path.to_str().unwrap()])
+        let third = from_flags(&["--secret-file", path.to_str().unwrap()])
             .stats()
             .telegram_secret();
         assert_ne!(third, first);
-        let fourth = parse(&["--secret-file", path.to_str().unwrap()])
+        let fourth = from_flags(&["--secret-file", path.to_str().unwrap()])
             .stats()
             .telegram_secret();
         assert_eq!(third, fourth, "the replacement must be persisted in turn");

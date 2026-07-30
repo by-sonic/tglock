@@ -135,6 +135,43 @@ jobs:
             ./target/release/tglock-cli --port 18080 --secret-file "$PWD/secret" > restart.log 2>&1
           test "$first" = "$(grep -o 'secret=[0-9a-f]*' restart.log)"
 
+      # Настройки из файла и приоритет флага над файлом.
+      - name: Read settings from a file
+        run: |
+          cat > tglock.toml <<'CONF'
+          port = 18090
+          secret = "dd00112233445566778899aabbccddeeff"
+          worker = ["example.workers.dev"]
+          CONF
+          timeout --preserve-status --signal=TERM 5 \
+            ./target/release/tglock-cli --config tglock.toml > conf.log 2>&1
+          cat conf.log
+          grep -q '127.0.0.1:18090' conf.log
+          grep -q 'secret=dd00112233445566778899aabbccddeeff' conf.log
+          grep -q 'example.workers.dev' conf.log
+          # Флаг должен перекрывать файл.
+          timeout --preserve-status --signal=TERM 5 \
+            ./target/release/tglock-cli --config tglock.toml --port 18091 > over.log 2>&1
+          grep -q '127.0.0.1:18091' over.log
+          # Опечатка в файле обязана быть ошибкой, а не молчаливым дефолтом.
+          echo 'porrt = 1443' > bad.toml
+          if ./target/release/tglock-cli --config bad.toml; then
+            echo "опечатка в конфиге прошла незамеченной"; exit 1
+          fi
+
+      # Закрытый stdout не должен ронять демон: println! при ошибке записи
+      # паникует, а канал закрывается штатно — `| head`, закрытый терминал,
+      # перезапуск сборщика логов.
+      - name: Survive a closed stdout
+        run: |
+          set +e
+          timeout --signal=TERM 5 ./target/release/tglock-cli --port 18092 2> pipe-err.log | head -2
+          set -e
+          cat pipe-err.log
+          if grep -qi 'panic' pipe-err.log; then
+            echo "демон упал из-за закрытого stdout"; exit 1
+          fi
+
   msrv:
     name: Rust 1.88 compatibility
     runs-on: macos-latest
