@@ -72,7 +72,7 @@ jobs:
             - Linux: скачайте `.AppImage` или `.deb`
             - Сервер или машина без монитора: скачайте `tglock-cli-*` — там нет графического интерфейса
           releaseDraft: false
-          prerelease: true
+          prerelease: false
           args: ${{ matrix.args }}
 
   cli:
@@ -140,5 +140,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
-          prerelease: true
+          prerelease: false
           files: ${{ matrix.asset }}

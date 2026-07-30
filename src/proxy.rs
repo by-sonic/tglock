@@ -561,31 +561,38 @@ mod tests {
     /// Stand-in for `kwsN.web.telegram.org`: a plaintext WebSocket that behaves
     /// like an obfuscated2 relay.
     ///
-    /// Returns the raw init frame it was handed and the plaintext it recovered,
-    /// so a test can assert on what Telegram would really have seen.
+    /// Returns the URI it was asked for, the raw init frame it was handed and
+    /// the plaintext it recovered, so a test can assert on what Telegram — or a
+    /// Cloudflare Worker standing in for it — would really have seen.
     // The handshake callback's error type is tungstenite's own `ErrorResponse`,
     // whose size is not ours to change.
     #[allow(clippy::result_large_err)]
     async fn mock_relay(
         listener: TcpListener,
         response: Vec<u8>,
-    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+    ) -> Result<(String, Vec<u8>, Vec<u8>), String> {
         use futures_util::{SinkExt, StreamExt};
 
         let (tcp, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        let requested = Arc::new(Mutex::new(String::new()));
+        let seen = requested.clone();
         // Telegram confirms the `binary` subprotocol the proxy asks for, and
         // tungstenite refuses a handshake that silently drops it. A mock that
         // does not answer it would only ever test the failure path.
-        let mut websocket =
-            tokio_tungstenite::accept_hdr_async(tcp, |_: &Request, mut response: Response| {
+        let mut websocket = tokio_tungstenite::accept_hdr_async(
+            tcp,
+            move |request: &Request, mut response: Response| {
+                *seen.lock().unwrap() = request.uri().to_string();
                 response.headers_mut().insert(
                     "Sec-WebSocket-Protocol",
                     "binary".parse().expect("static header value"),
                 );
                 Ok(response)
-            })
-            .await
-            .map_err(|e| e.to_string())?;
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let requested = requested.lock().unwrap().clone();
 
         let init = match websocket.next().await {
             Some(Ok(Message::Binary(data))) => data,
@@ -615,7 +622,7 @@ mod tests {
             .send(Message::Binary(wire))
             .await
             .map_err(|e| e.to_string())?;
-        Ok((init, request))
+        Ok((requested, init, request))
     }
 
     #[tokio::test]
@@ -896,7 +903,7 @@ mod tests {
             "the client must see Telegram's plaintext"
         );
 
-        let (init_frame, relayed) = relay.await.unwrap().unwrap();
+        let (_, init_frame, relayed) = relay.await.unwrap().unwrap();
         assert_eq!(init_frame.len(), INIT_LEN);
         assert_ne!(
             init_frame.as_slice(),
@@ -914,6 +921,60 @@ mod tests {
             crate::transport::RouteKind::TelegramIp.ui_code()
         );
         assert_eq!(stats.ws_failures.load(Ordering::Relaxed), 0);
+
+        stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connects_through_the_documented_worker_contract() {
+        // Locks the contract in docs/CLOUDFLARE_WORKER.md: a server that
+        // implements exactly what is documented there must carry a working
+        // tunnel, and must be asked for exactly the documented URI.
+        let dc = 2;
+        let path = crate::transport::worker_path(dc).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_port = listener.local_addr().unwrap().port();
+        let response = b"an answer relayed by the worker".to_vec();
+        let worker = tokio::spawn(mock_relay(listener, response.clone()));
+
+        let stats = Stats::new();
+        stats.transport.force_local_route_with(
+            worker_port,
+            crate::transport::RouteKind::CloudflareWorker,
+            path.clone(),
+        );
+        let (port, server) = start_proxy(stats.clone(), false).await;
+
+        let init = unambiguous_client_init(&stats.secret, dc as i16);
+        let mut peer = crate::mtproto::test_client_peer(&init, &stats.secret);
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(&init).await.unwrap();
+
+        let request = b"a request relayed to the worker".to_vec();
+        let mut wire = request.clone();
+        peer.encrypt(&mut wire);
+        client.write_all(&wire).await.unwrap();
+
+        let mut received = vec![0; response.len()];
+        tokio::time::timeout(Duration::from_secs(10), client.read_exact(&mut received))
+            .await
+            .expect("the worker's answer must come back through the tunnel")
+            .unwrap();
+        peer.decrypt(&mut received);
+        assert_eq!(received, response);
+
+        let (requested, _, relayed) = worker.await.unwrap().unwrap();
+        assert_eq!(
+            requested, path,
+            "a deployed worker must serve exactly the documented path and query"
+        );
+        assert_eq!(relayed, request);
+        assert_eq!(
+            stats.last_route.load(Ordering::Relaxed),
+            crate::transport::RouteKind::CloudflareWorker.ui_code()
+        );
 
         stats.stop();
         let _ = server.await.unwrap();

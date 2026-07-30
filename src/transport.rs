@@ -122,11 +122,15 @@ impl TransportEngine {
     /// Point every data centre at a local plaintext WebSocket server so the
     /// whole tunnel can be exercised without reaching Telegram.
     pub(crate) fn force_local_route(&self, port: u16) {
+        self.force_local_route_with(port, RouteKind::TelegramIp, "/apiws".to_owned());
+    }
+
+    pub(crate) fn force_local_route_with(&self, port: u16, kind: RouteKind, path: String) {
         *self.forced_routes.lock().unwrap() = vec![Route {
             connect_host: "127.0.0.1".to_owned(),
             websocket_host: format!("127.0.0.1:{}", port),
-            path: "/apiws".to_owned(),
-            kind: RouteKind::TelegramIp,
+            path,
+            kind,
             port,
             secure: false,
         }];
@@ -233,14 +237,15 @@ impl TransportEngine {
         }
 
         let mut routes = routes_for_dc(key.dc, key.media);
-        let Some(destination) = telegram_ips(key.dc).first() else {
+        let Some(path) = worker_path(key.dc) else {
             return routes;
         };
         for domain in self.worker_domains.lock().unwrap().iter() {
+            let path = path.clone();
             routes.push(Route::https(
                 domain.clone(),
                 domain.clone(),
-                format!("/apiws?dst={}&dc={}", destination, key.dc),
+                path,
                 RouteKind::CloudflareWorker,
             ));
         }
@@ -271,6 +276,28 @@ impl TransportEngine {
             },
         );
     }
+}
+
+/// Path a user's Cloudflare Worker must serve for the given data centre.
+///
+/// This is the contract documented in `docs/CLOUDFLARE_WORKER.md`; both the
+/// route builder and the tests derive the path from here so the documentation
+/// cannot drift away from what the client actually requests.
+pub(crate) fn worker_path(dc: u16) -> Option<String> {
+    let destination = telegram_ips(dc).first()?;
+    Some(format!("/apiws?dst={}&dc={}", destination, dc))
+}
+
+/// Every address a Worker may be asked to reach, so a deployment can refuse
+/// anything else instead of becoming an open TCP proxy.
+pub fn worker_allowed_destinations() -> Vec<&'static str> {
+    let mut all: Vec<_> = [1, 2, 3, 4, 5, 203]
+        .into_iter()
+        .flat_map(|dc| telegram_ips(dc).iter().copied())
+        .collect();
+    all.sort_unstable();
+    all.dedup();
+    all
 }
 
 fn canonical_dc(dc: u16) -> u16 {
@@ -626,6 +653,39 @@ mod tests {
             candidates.last().unwrap().kind,
             RouteKind::CloudflareWorker,
             "third-party infrastructure must never be tried before Telegram itself"
+        );
+    }
+
+    #[test]
+    fn documented_worker_contract_matches_the_requested_path() {
+        // docs/CLOUDFLARE_WORKER.md promises exactly this shape.
+        assert_eq!(
+            worker_path(2).unwrap(),
+            "/apiws?dst=149.154.167.51&dc=2",
+            "the documented contract must match what the client requests"
+        );
+        assert_eq!(
+            worker_path(203).unwrap(),
+            "/apiws?dst=91.105.192.100&dc=203"
+        );
+        assert_eq!(worker_path(42), None);
+    }
+
+    #[test]
+    fn worker_allowlist_covers_every_address_a_route_can_ask_for() {
+        let allowed = worker_allowed_destinations();
+        for dc in [1, 2, 3, 4, 5, 203] {
+            for ip in telegram_ips(dc) {
+                assert!(
+                    allowed.contains(ip),
+                    "{ip} is reachable via a route but missing from the Worker allowlist"
+                );
+            }
+        }
+        assert_eq!(
+            allowed.len(),
+            7,
+            "the allowlist in worker/tglock-worker.js must be updated alongside this"
         );
     }
 
