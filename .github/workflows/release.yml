@@ -75,6 +75,29 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
+      # Смотрит внутрь собранного бандла. v2.0.0-beta.2 опубликовался с зелёным
+      # CI, хотя .app и .deb содержали headless CLI вместо приложения: сборка
+      # была успешной, просто никто не проверял, что внутри.
+      - name: The bundle must contain the GUI binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app=$(find target -maxdepth 6 -name 'TGLock.app' -type d | head -1)
+          test -n "$app" || { echo "TGLock.app не найден"; exit 1; }
+          exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
+          echo "CFBundleExecutable = $exe"
+          test "$exe" = "tglock" || { echo "в бандле не GUI-бинарь"; exit 1; }
+          test -x "$app/Contents/MacOS/tglock" || { echo "исполняемый файл отсутствует"; exit 1; }
+
+      - name: The bundle must contain the GUI binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          deb=$(find target -maxdepth 6 -name '*.deb' | head -1)
+          test -n "$deb" || { echo ".deb не найден"; exit 1; }
+          dpkg-deb -c "$deb" | grep -E ' \./usr/bin/tglock$' \
+            || { echo "в .deb нет /usr/bin/tglock:"; dpkg-deb -c "$deb" | grep '/bin/'; exit 1; }
+
   cli:
     name: Headless CLI ${{ matrix.platform }}
     needs: publish
