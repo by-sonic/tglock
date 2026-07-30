@@ -1,6 +1,6 @@
 [package]
 name = "tglock"
-version = "2.0.0-beta.3"
+version = "2.0.0-beta.4"
 edition = "2021"
 rust-version = "1.88"
 description = "Telegram unblock via local WebSocket tunnel"
@@ -13,6 +13,14 @@ default = ["gui"]
 # frontend bundle from the build, which is what makes headless servers and
 # machines without a GPU or monitor able to build and run TGLock at all.
 gui = ["dep:tauri", "dep:tauri-build", "dep:open"]
+# The headless binary. Deliberately NOT in `default`.
+#
+# When both binaries exist in one build, the Tauri bundler picks the wrong one
+# as the application: `tauri build --target <triple>` packaged tglock-cli and
+# shipped it as the app in v2.0.0-beta.2 and v2.0.0-beta.3. Keeping the CLI
+# behind its own non-default feature means it simply does not exist during an
+# application build, so there is nothing to pick wrongly.
+cli = ["dep:clap"]
 
 [lib]
 name = "tglock"
@@ -26,11 +34,12 @@ required-features = ["gui"]
 [[bin]]
 name = "tglock-cli"
 path = "src/bin/cli.rs"
+required-features = ["cli"]
 
 [dependencies]
 tauri = { version = "2", features = [], optional = true }
 open = { version = "5", optional = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = [

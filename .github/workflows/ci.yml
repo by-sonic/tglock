@@ -58,6 +58,47 @@ jobs:
       - name: Test
         run: cargo test --all-targets
 
+  bundle:
+    name: Bundled app must be the GUI binary
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      # Явный --target обязателен: без него бандлер выбирал правильный бинарь, а
+      # с ним — нет, и именно так beta.2 и beta.3 уехали с headless CLI внутри.
+      - name: Bundle the app
+        run: npx tauri build --bundles app --target aarch64-apple-darwin
+
+      # Проверяется содержимое, а не имя файла. В beta.3 имя было уже
+      # правильным, потому что бандлер переименовал CLI, и проверка имени
+      # ничего не заметила.
+      - name: The bundled binary must actually be the GUI one
+        run: |
+          exe=$(find target -maxdepth 8 -path '*TGLock.app/Contents/MacOS/tglock' | head -1)
+          test -n "$exe" || { echo "исполняемый файл бандла не найден"; find target -name 'TGLock.app' -maxdepth 6; exit 1; }
+          ls -la "$exe"
+          if ! grep -qa 'ipc\.localhost' "$exe"; then
+            echo "в бандле не GUI: отсутствует признак ipc.localhost"; exit 1
+          fi
+          if grep -qa 'allow-direct' "$exe"; then
+            echo "в бандле оказался headless CLI: найден признак allow-direct"; exit 1
+          fi
+          echo "OK: в бандле GUI-бинарь"
+
   headless:
     name: Headless CLI (no WebView, no Node)
     runs-on: ubuntu-22.04
@@ -73,13 +114,13 @@ jobs:
       # libwebkit2gtk. It fails the moment anything drags the GUI back into the
       # headless build, which is the whole point of issues #10 and #17.
       - name: Lint
-        run: cargo clippy --no-default-features --lib --bins --all-targets -- -D warnings
+        run: cargo clippy --no-default-features --features cli --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --no-default-features --lib --bins
+        run: cargo test --no-default-features --features cli --lib --bins
 
       - name: Build
-        run: cargo build --release --no-default-features --bin tglock-cli
+        run: cargo build --release --no-default-features --features cli --bin tglock-cli
 
       - name: Start, advertise a proxy link and stop on SIGTERM
         run: |
@@ -123,7 +164,7 @@ jobs:
         run: cargo check --locked
 
       - name: Check the headless dependency graph too
-        run: cargo check --locked --no-default-features --lib --bins
+        run: cargo check --locked --no-default-features --features cli --lib --bins
 
   frontend:
     name: Frontend
