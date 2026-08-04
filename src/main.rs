@@ -44,6 +44,9 @@ struct StatusSnapshot {
     data_center: Option<u16>,
     route: String,
     failures: u32,
+    /// Падения отдельных маршрутов. Растёт даже когда соединение в итоге
+    /// состоялось через запасной адрес (by-sonic/tglock#32).
+    route_failures: u32,
     uptime_seconds: u64,
     port: u16,
     logs: Vec<LogLine>,
@@ -96,6 +99,7 @@ impl AppState {
             data_center: (data_center > 0).then_some(data_center),
             route: route.to_owned(),
             failures: self.stats.ws_failures.load(Ordering::Relaxed),
+            route_failures: self.stats.route_failures(),
             uptime_seconds: self
                 .started_at
                 .lock()
@@ -279,7 +283,17 @@ fn main() {
                 .app_config_dir()
                 .map_err(|error| error.to_string())?
                 .join("settings.json");
-            app.manage(AppState::new(settings_path));
+            let state = AppState::new(settings_path);
+            // Если секрет не удалось записать, ссылка tg://proxy изменится после
+            // перезапуска и Telegram откажется подключаться к сохранённой.
+            // Раньше это происходило молча (by-sonic/tglock#37).
+            if let Some(error) = state.stats.secret_write_error() {
+                state.log(
+                    format!("Секрет не сохранён ({error}). После перезапуска ссылка изменится"),
+                    true,
+                );
+            }
+            app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -113,6 +114,14 @@ struct HealthState {
 pub struct TransportEngine {
     health: Mutex<HealthState>,
     worker_domains: Mutex<Vec<String>>,
+    /// Сколько раз отдельный маршрут не ответил.
+    ///
+    /// Считается отдельно от `Stats::ws_failures`, который растёт только когда
+    /// упали ВСЕ маршруты. Из-за этого диагностика показывала «сбоев 0», пока
+    /// закреплённый адрес был недоступен и каждое холодное соединение молча
+    /// откатывалось на следующий маршрут, тратя на это до восьми секунд
+    /// (by-sonic/tglock#32).
+    route_failures: AtomicU32,
     #[cfg(test)]
     forced_routes: Mutex<Vec<Route>>,
 }
@@ -258,7 +267,13 @@ impl TransportEngine {
         health.preferred.insert(key, route.clone());
     }
 
+    /// Сколько отдельных маршрутов не ответило за время работы.
+    pub fn route_failures(&self) -> u32 {
+        self.route_failures.load(Ordering::Relaxed)
+    }
+
     fn record_failure(&self, route: &Route) {
+        self.route_failures.fetch_add(1, Ordering::Relaxed);
         let mut health = self.health.lock().unwrap();
         let failures = health
             .routes
@@ -654,6 +669,38 @@ mod tests {
             RouteKind::CloudflareWorker,
             "third-party infrastructure must never be tried before Telegram itself"
         );
+    }
+
+    #[test]
+    fn every_route_failure_is_counted() {
+        // Диагностика показывала «сбоев 0», пока закреплённый адрес был мёртв и
+        // соединения молча откатывались на запасной. Счётчик маршрутов должен
+        // видеть каждое такое падение.
+        let engine = TransportEngine::new();
+        let routes = routes_for_dc(2, false);
+        assert_eq!(engine.route_failures(), 0);
+
+        engine.record_failure(&routes[0]);
+        assert_eq!(engine.route_failures(), 1);
+
+        engine.record_failure(&routes[0]);
+        engine.record_failure(&routes[1]);
+        assert_eq!(
+            engine.route_failures(),
+            3,
+            "считаются все падения, включая повторные по тому же маршруту"
+        );
+
+        // Успех не обнуляет историю: она нужна, чтобы понять, что маршруты
+        // перебирались, даже когда в итоге всё соединилось.
+        engine.record_success(
+            DcKey {
+                dc: 2,
+                media: false,
+            },
+            &routes[1],
+        );
+        assert_eq!(engine.route_failures(), 3);
     }
 
     #[test]

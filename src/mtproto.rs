@@ -51,31 +51,64 @@ pub fn generate_secret() -> [u8; 16] {
     secret
 }
 
-/// Reuse the secret stored at `path`, creating it if it is missing or unusable.
+/// Секрет прокси и то, лежит ли он на диске.
+pub struct StoredSecret {
+    pub value: [u8; 16],
+    /// Ошибка, из-за которой секрет не удалось сохранить.
+    ///
+    /// Если она есть, при следующем запуске секрет будет другим, ссылка
+    /// `tg://proxy` перестанет совпадать с сохранённой в Telegram, и Telegram
+    /// скажет «прокси настроен неверно и будет отключён». Раньше запись
+    /// провалившись молчала, и понять причину было невозможно
+    /// (by-sonic/tglock#37).
+    pub write_error: Option<String>,
+}
+
+impl StoredSecret {
+    /// Секрет действительно переживёт перезапуск.
+    pub fn is_persistent(&self) -> bool {
+        self.write_error.is_none()
+    }
+}
+
+/// Взять секрет из файла, создав его, если файла нет или он испорчен.
 ///
-/// A daemon needs this: the secret is half of the `tg://proxy` link, so a
-/// service that invents a new one on every restart silently invalidates every
-/// client that was already configured.
-pub fn load_or_create_secret_at(path: &Path) -> [u8; 16] {
+/// Секрет — половина ссылки `tg://proxy`, поэтому сервис, придумывающий новый
+/// при каждом старте, отключает всех уже настроенных клиентов.
+pub fn load_or_create_secret_at(path: &Path) -> StoredSecret {
     if let Ok(value) = std::fs::read_to_string(path) {
-        if let Some(secret) = parse_secret_hex(value.trim()) {
-            return secret;
+        if let Some(value) = parse_secret_hex(value.trim()) {
+            return StoredSecret {
+                value,
+                write_error: None,
+            };
         }
     }
 
-    let secret = generate_secret();
+    let value = generate_secret();
+    let write_error = store_secret(path, &secret_hex(&value))
+        .err()
+        .map(|error| format!("{}: {error}", path.display()));
+    StoredSecret { value, write_error }
+}
+
+fn store_secret(path: &Path, value: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
-    write_secret_file(path, &secret_hex(&secret));
-    secret
+    write_secret_file(path, value)
 }
 
 #[cfg(not(test))]
-pub fn load_or_create_secret() -> [u8; 16] {
+pub fn load_or_create_secret() -> StoredSecret {
     match secret_path() {
         Some(path) => load_or_create_secret_at(&path),
-        None => generate_secret(),
+        None => StoredSecret {
+            value: generate_secret(),
+            write_error: Some("не удалось определить папку для секрета в этой системе".to_owned()),
+        },
     }
 }
 
@@ -105,23 +138,21 @@ fn secret_path() -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn write_secret_file(path: &Path, value: &str) {
+fn write_secret_file(path: &Path, value: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .mode(0o600)
-        .open(path)
-    {
-        let _ = file.write_all(value.as_bytes());
-    }
+        .open(path)?;
+    file.write_all(value.as_bytes())
 }
 
 #[cfg(not(unix))]
-fn write_secret_file(path: &Path, value: &str) {
-    let _ = std::fs::write(path, value);
+fn write_secret_file(path: &Path, value: &str) -> std::io::Result<()> {
+    std::fs::write(path, value)
 }
 
 pub fn secret_hex(secret: &[u8; 16]) -> String {
@@ -512,6 +543,59 @@ mod tests {
         for _ in 0..2_000 {
             assert!(!is_reserved_init(&generate_relay_init(ABRIDGED, 2)));
         }
+    }
+
+    #[test]
+    fn a_failed_write_is_reported_instead_of_swallowed() {
+        // Раньше ошибка записи выбрасывалась, секрет генерировался заново при
+        // каждом запуске, и Telegram говорил «прокси настроен неверно» без
+        // единой подсказки почему (by-sonic/tglock#37).
+        let blocker = std::env::temp_dir().join(format!(
+            "tglock-not-a-dir-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&blocker, "я файл, а не папка").unwrap();
+
+        // Родитель пути — обычный файл, поэтому создать каталог невозможно.
+        let stored = load_or_create_secret_at(&blocker.join("secret"));
+
+        assert!(
+            !stored.is_persistent(),
+            "неудачная запись обязана быть видна"
+        );
+        let error = stored.write_error.expect("должно быть сообщение об ошибке");
+        assert!(
+            error.contains("secret"),
+            "в сообщении должен быть путь, получено: {error}"
+        );
+        // Секрет всё равно выдан: прокси работает, просто до перезапуска.
+        assert_ne!(stored.value, [0; 16]);
+
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn a_successful_write_reports_no_error() {
+        let path = std::env::temp_dir().join(format!(
+            "tglock-secret-ok-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let first = load_or_create_secret_at(&path);
+        assert!(first.is_persistent(), "запись в temp должна удаваться");
+
+        // Второй запуск читает готовый файл и тоже не жалуется.
+        let second = load_or_create_secret_at(&path);
+        assert!(second.is_persistent());
+        assert_eq!(
+            first.value, second.value,
+            "секрет должен переживать перезапуск"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

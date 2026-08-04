@@ -142,6 +142,15 @@ async fn serve(args: Args) -> Result<(), String> {
             "Ссылка для Telegram: {}",
             listen.telegram_link(&stats.telegram_secret())
         ));
+        // Запись секрета могла провалиться — тогда после перезапуска ссылка
+        // изменится и Telegram скажет «прокси настроен неверно». Раньше это
+        // происходило молча (by-sonic/tglock#37).
+        if let Some(error) = stats.secret_write_error() {
+            say(&format!(
+                "Внимание: секрет НЕ сохранён ({error}). После перезапуска ссылка \
+                 изменится, и Telegram откажется подключаться к старой"
+            ));
+        }
         if matches!(settings.secret, config::SecretSource::Ephemeral) {
             say(
                 "Внимание: секрет не закреплён и будет новым после перезапуска — \
@@ -202,13 +211,15 @@ async fn watch_status(stats: Arc<proxy::Stats>) {
             stats.last_dc.load(Ordering::Relaxed),
             stats.last_route.load(Ordering::Relaxed),
             stats.ws_failures.load(Ordering::Relaxed),
+            stats.route_failures(),
         );
         if previous.as_ref() == Some(&current) {
             continue;
         }
-        let (active, tunnels, dc, route, failures) = current;
+        let (active, tunnels, dc, route, failures, route_failures) = current;
         let line = format!(
-            "соединений {active} · туннелей {tunnels} · {} · {} · сбоев {failures}",
+            "соединений {active} · туннелей {tunnels} · {} · {} · сбоев {failures} · \
+             падений маршрутов {route_failures}",
             if dc > 0 {
                 format!("DC{dc}")
             } else {
