@@ -27,12 +27,23 @@ pub struct Stats {
     pub last_route: AtomicU8,
     transport: crate::transport::TransportEngine,
     secret: [u8; 16],
+    /// Почему секрет не удалось сохранить, если не удалось.
+    secret_write_error: Option<String>,
     shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
 impl Stats {
     pub fn new() -> Arc<Self> {
-        Self::with_secret(initial_secret())
+        Self::with_stored_secret(initial_secret())
+    }
+
+    /// Построить с секретом, про который известно, сохранился он на диск или нет.
+    ///
+    /// Если не сохранился, при следующем запуске ссылка `tg://proxy` изменится и
+    /// Telegram скажет «прокси настроен неверно и будет отключён». Раньше это
+    /// происходило молча (by-sonic/tglock#37).
+    pub fn with_stored_secret(stored: crate::mtproto::StoredSecret) -> Arc<Self> {
+        Self::build(stored.value, stored.write_error)
     }
 
     /// Build with an explicit proxy secret.
@@ -40,6 +51,15 @@ impl Stats {
     /// A daemon must pin this: the secret is half of the `tg://proxy` link, so
     /// generating a fresh one on restart breaks every configured client.
     pub fn with_secret(secret: [u8; 16]) -> Arc<Self> {
+        Self::build(secret, None)
+    }
+
+    /// Сообщение о том, почему секрет не сохранён, если он не сохранён.
+    pub fn secret_write_error(&self) -> Option<&str> {
+        self.secret_write_error.as_deref()
+    }
+
+    fn build(secret: [u8; 16], secret_write_error: Option<String>) -> Arc<Self> {
         Arc::new(Self {
             running: AtomicBool::new(false),
             active: AtomicU32::new(0),
@@ -50,12 +70,23 @@ impl Stats {
             last_route: AtomicU8::new(0),
             transport: crate::transport::TransportEngine::new(),
             secret,
+            secret_write_error,
             shutdown: Mutex::new(None),
         })
     }
 
     pub fn telegram_secret(&self) -> String {
         crate::mtproto::telegram_secret(&self.secret)
+    }
+
+    /// Сколько отдельных маршрутов не ответило.
+    ///
+    /// Отличается от `ws_failures`: тот растёт только когда упали все маршруты
+    /// и соединение не состоялось. Этот показывает перебор, который прошёл
+    /// незаметно — например, когда закреплённый адрес мёртв, а запасной
+    /// работает (by-sonic/tglock#32).
+    pub fn route_failures(&self) -> u32 {
+        self.transport.route_failures()
     }
 
     pub fn set_worker_domain(&self, domain: &str) {
@@ -75,13 +106,16 @@ impl Stats {
 }
 
 #[cfg(not(test))]
-fn initial_secret() -> [u8; 16] {
+fn initial_secret() -> crate::mtproto::StoredSecret {
     crate::mtproto::load_or_create_secret()
 }
 
 #[cfg(test)]
-fn initial_secret() -> [u8; 16] {
-    crate::mtproto::generate_secret()
+fn initial_secret() -> crate::mtproto::StoredSecret {
+    crate::mtproto::StoredSecret {
+        value: crate::mtproto::generate_secret(),
+        write_error: None,
+    }
 }
 
 /// Claim the local port.

@@ -88,7 +88,7 @@ impl Resolved {
         let stats = match &self.secret {
             SecretSource::Inline(secret) => proxy::Stats::with_secret(*secret),
             SecretSource::File(path) => {
-                proxy::Stats::with_secret(mtproto::load_or_create_secret_at(path))
+                proxy::Stats::with_stored_secret(mtproto::load_or_create_secret_at(path))
             }
             SecretSource::Ephemeral => proxy::Stats::new(),
         };

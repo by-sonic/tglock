@@ -10,6 +10,7 @@ type Status = {
   dataCenter: number | null;
   route: string;
   failures: number;
+  routeFailures: number;
   uptimeSeconds: number;
   port: number;
   logs: LogLine[];
@@ -37,6 +38,7 @@ let status: Status = {
   dataCenter: null,
   route: "Маршрут ещё не выбран",
   failures: 0,
+  routeFailures: 0,
   uptimeSeconds: 0,
   port: 1080,
   logs: [],
@@ -261,7 +263,17 @@ function renderDiagnostics(): void {
           <span>Время работы</span>
           <strong class="time">${formatUptime(status.uptimeSeconds)}</strong>
         </article>
+        <article class="metric-card">
+          <span>Падений маршрутов</span>
+          <strong>${status.routeFailures}</strong>
+        </article>
       </div>
+
+      <p class="field-hint">
+        «Падений маршрутов» больше нуля при работающем Telegram — это норма:
+        значит закреплённый адрес недоступен и подключение идёт через запасной.
+        Число в багрепорте помогает понять, что именно перебиралось.
+      </p>
 
       <div class="log-panel">
         <div class="log-heading">
