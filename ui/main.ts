@@ -13,6 +13,8 @@ type Status = {
   routeFailures: number;
   uptimeSeconds: number;
   port: number;
+  /// Адрес для других устройств. Приходит только в LAN-режиме.
+  shareAddress: string | null;
   logs: LogLine[];
 };
 
@@ -41,6 +43,7 @@ let status: Status = {
   routeFailures: 0,
   uptimeSeconds: 0,
   port: 1080,
+  shareAddress: null,
   logs: [],
 };
 let settings: Settings = { lanMode: false, port: 1080, workerDomain: "" };
@@ -147,6 +150,18 @@ function renderHome(): void {
         <span>порт ${status.port}</span>
       </div>
 
+      ${status.shareAddress ? `
+      <div class="share-card">
+        <div class="share-label">Адрес для других устройств</div>
+        <button id="copy-address" class="share-address" title="Нажмите, чтобы скопировать">
+          ${escapeHtml(status.shareAddress)}
+        </button>
+        <div class="share-hint">
+          Впишите его в Telegram на телефоне. Не <code>127.0.0.1</code> — на другом
+          устройстве это означает само устройство.
+        </div>
+      </div>` : ""}
+
       <nav class="bottom-nav" aria-label="Разделы">
         <button id="settings-nav" class="nav-button">
           <span class="nav-icon">${icons.settings}</span>
@@ -162,6 +177,7 @@ function renderHome(): void {
   `, "home-page");
 
   document.querySelector("#power")?.addEventListener("click", toggleProtection);
+  document.querySelector("#copy-address")?.addEventListener("click", copyShareAddress);
   document.querySelector("#settings-nav")?.addEventListener("click", () => navigate("settings"));
   document.querySelector("#diagnostics-nav")?.addEventListener("click", () => navigate("diagnostics"));
 }
@@ -365,6 +381,18 @@ async function saveSettings(event: Event): Promise<void> {
     showToast(String(error), true);
   } finally {
     busy = false;
+  }
+}
+
+async function copyShareAddress(): Promise<void> {
+  const address = status.shareAddress;
+  if (!address) return;
+  try {
+    await navigator.clipboard.writeText(address);
+    showToast("Адрес скопирован");
+  } catch {
+    // Буфер обмена может быть недоступен — адрес и так виден на экране.
+    showToast("Скопируйте адрес вручную", true);
   }
 }
 

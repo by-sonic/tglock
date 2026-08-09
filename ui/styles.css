@@ -847,3 +847,53 @@ input:disabled {
       0 19px 52px rgba(9, 182, 133, 0.4);
   }
 }
+
+/* Адрес для подключения других устройств. Показывается только в LAN-режиме:
+   люди искали его в интерфейсе, не находили и вписывали 127.0.0.1, который на
+   телефоне означает сам телефон (by-sonic/tglock#36). */
+.share-card {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: rgba(42, 171, 238, 0.08);
+  border: 1px solid rgba(42, 171, 238, 0.24);
+  text-align: center;
+}
+
+.share-label {
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: var(--text-muted, #8b949e);
+}
+
+.share-address {
+  display: block;
+  width: 100%;
+  margin: 6px 0 8px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--accent, #2aabee);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 20px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 150ms ease;
+}
+
+.share-address:hover,
+.share-address:focus-visible {
+  background: rgba(42, 171, 238, 0.14);
+}
+
+.share-hint {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-muted, #8b949e);
+}
+
+.share-hint code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
