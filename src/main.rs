@@ -49,6 +49,13 @@ struct StatusSnapshot {
     route_failures: u32,
     uptime_seconds: u64,
     port: u16,
+    /// Адрес, который нужно вписать в Telegram на другом устройстве.
+    ///
+    /// В LAN-режиме это адрес этого компьютера в локальной сети. Люди искали
+    /// его в интерфейсе и не находили: вписывали `127.0.0.1`, который на
+    /// телефоне или в эмуляторе означает само устройство, и подключение не
+    /// работало (by-sonic/tglock#36).
+    share_address: Option<String>,
     logs: Vec<LogLine>,
 }
 
@@ -56,6 +63,10 @@ struct AppState {
     stats: Arc<proxy::Stats>,
     settings: Mutex<Settings>,
     active_port: Mutex<u16>,
+    /// Слушатель работающего прокси. Нужен, чтобы показать адрес для других
+    /// устройств именно тот, на котором прокси реально поднят, а не тот, что
+    /// сейчас выбран в настройках.
+    active_listen: Mutex<Option<ListenConfig>>,
     started_at: Mutex<Option<Instant>>,
     logs: Arc<Mutex<Vec<LogLine>>>,
     settings_path: PathBuf,
@@ -71,6 +82,7 @@ impl AppState {
             stats: proxy::Stats::new(),
             settings: Mutex::new(settings),
             active_port: Mutex::new(proxy::DEFAULT_PORT),
+            active_listen: Mutex::new(None),
             started_at: Mutex::new(None),
             logs: Arc::new(Mutex::new(Vec::new())),
             settings_path,
@@ -106,6 +118,7 @@ impl AppState {
                 .unwrap()
                 .map_or(0, |started| started.elapsed().as_secs()),
             port: *self.active_port.lock().unwrap(),
+            share_address: share_address(*self.active_listen.lock().unwrap()),
             logs: self.logs.lock().unwrap().clone(),
         }
     }
@@ -120,6 +133,18 @@ impl AppState {
         std::fs::write(&self.settings_path, contents)
             .map_err(|error| format!("Не удалось сохранить настройки: {error}"))
     }
+}
+
+/// Адрес, который нужно вписать в Telegram на другом устройстве.
+///
+/// Только для слушателя на `0.0.0.0`: на loopback делиться нечем, туда никто
+/// извне не достучится. Возвращается адрес этой машины в сети, а не `0.0.0.0`
+/// и не `127.0.0.1` — последний на телефоне или в эмуляторе означает само
+/// устройство, и именно на этом спотыкались (by-sonic/tglock#36).
+fn share_address(listen: Option<ListenConfig>) -> Option<String> {
+    listen
+        .filter(|listen| listen.addr.ip().is_unspecified())
+        .map(|listen| format!("{}:{}", listen.advertised_host(), listen.addr.port()))
 }
 
 fn current_time() -> String {
@@ -177,6 +202,8 @@ fn start_proxy(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
         ListenConfig::loopback(settings.port)
     };
 
+    *state.active_listen.lock().unwrap() = Some(listen);
+
     let stats = state.stats.clone();
     let logs = state.logs.clone();
     std::thread::spawn(move || {
@@ -194,6 +221,7 @@ fn start_proxy(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
 
     std::thread::sleep(std::time::Duration::from_millis(220));
     if !state.stats.running.load(Ordering::SeqCst) {
+        *state.active_listen.lock().unwrap() = None;
         *state.started_at.lock().unwrap() = None;
         return Err(state
             .logs
@@ -213,6 +241,7 @@ fn start_proxy(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
 #[tauri::command]
 fn stop_proxy(state: State<'_, AppState>) -> StatusSnapshot {
     state.stats.stop();
+    *state.active_listen.lock().unwrap() = None;
     *state.started_at.lock().unwrap() = None;
     state.log("Защита выключена", false);
     state.snapshot()
@@ -310,6 +339,34 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nothing_to_share_when_the_proxy_is_off_or_local() {
+        assert_eq!(
+            share_address(None),
+            None,
+            "выключенный прокси нечего делить"
+        );
+        assert_eq!(
+            share_address(Some(ListenConfig::loopback(1080))),
+            None,
+            "на loopback снаружи никто не подключится"
+        );
+    }
+
+    #[test]
+    fn lan_mode_shares_a_reachable_address() {
+        let shown = share_address(Some(ListenConfig::lan(1443))).expect("в LAN-режиме адрес нужен");
+        assert!(shown.ends_with(":1443"), "порт должен быть виден: {shown}");
+        assert!(
+            !shown.starts_with("0.0.0.0"),
+            "0.0.0.0 нельзя вписать в Telegram: {shown}"
+        );
+        assert!(
+            !shown.starts_with("127.0.0.1"),
+            "127.0.0.1 на другом устройстве означает само устройство: {shown}"
+        );
+    }
 
     #[test]
     fn software_rendering_is_requested_by_default() {
