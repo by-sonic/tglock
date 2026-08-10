@@ -9,7 +9,40 @@ permissions:
   contents: write
 
 jobs:
+  # Токен Actions умеет создавать релиз только на HEAD ветки по умолчанию. Если
+  # тег отстал хоть на один коммит, GitHub отвечает «Resource not accessible by
+  # integration» — сообщение про права, хотя права в порядке и дело в положении
+  # тега. Так утонул v2.0.0-beta.8: тег поставили, следом дописали коммит в main,
+  # и три сборки по восемь минут закончились загадочным 403.
+  #
+  # Проверка занимает секунды и идёт до сборок. Но она НЕ закрывает гонку: если
+  # запушить в main уже после её прохождения, публикация всё равно упадёт — как и
+  # случилось с beta.8. Единственная настоящая защита — порядок действий: тег
+  # ставится последним, и пока идёт релиз, в main не пушим.
+  guard:
+    name: Тег должен стоять на HEAD
+    runs-on: ubuntu-latest
+    steps:
+      - name: Сверить тег с веткой по умолчанию
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch=$(gh api "repos/$GITHUB_REPOSITORY" -q .default_branch)
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$branch" -q .sha)
+          if [ "$head" = "$GITHUB_SHA" ]; then
+            echo "$GITHUB_REF_NAME и $branch указывают на $head — собираем."
+            exit 0
+          fi
+          echo "::error::$GITHUB_REF_NAME стоит на $GITHUB_SHA, а $branch — на $head. Публикация упадёт с 403, потому что токен Actions создаёт релиз только на HEAD ветки по умолчанию."
+          echo "Переставьте тег и запушьте заново:"
+          echo "  git tag -d $GITHUB_REF_NAME"
+          echo "  git push origin :refs/tags/$GITHUB_REF_NAME"
+          echo "  git tag -a $GITHUB_REF_NAME $head -m 'TGLock ...'"
+          echo "  git push origin $GITHUB_REF_NAME"
+          exit 1
+
   publish:
+    needs: guard
     name: Build ${{ matrix.platform }}
     strategy:
       fail-fast: false
