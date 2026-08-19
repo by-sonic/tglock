@@ -13,6 +13,8 @@ type Status = {
   routeFailures: number;
   /// Отклонено политикой «в LAN-режиме только Telegram».
   blocked: number;
+  /// Клиенты, которые дошли, но не сумели договориться о рукопожатии.
+  unknownClients: number;
   uptimeSeconds: number;
   port: number;
   /// Адрес для других устройств. Приходит только в LAN-режиме.
@@ -44,6 +46,7 @@ let status: Status = {
   failures: 0,
   routeFailures: 0,
   blocked: 0,
+  unknownClients: 0,
   uptimeSeconds: 0,
   port: 1080,
   shareAddress: null,
@@ -290,6 +293,10 @@ function renderDiagnostics(): void {
           <span>Отклонено</span>
           <strong>${status.blocked}</strong>
         </article>
+        <article class="metric-card">
+          <span>Не опознаны</span>
+          <strong>${status.unknownClients}</strong>
+        </article>
       </div>
 
       <p class="field-hint">
@@ -303,6 +310,13 @@ function renderDiagnostics(): void {
         по адресам Telegram. Если с телефона ничего не работает, а здесь ноль и
         соединений тоже ноль, значит телефон до этого компьютера не дошёл —
         дело в сети или брандмауэре. Какие именно адреса отклонены, видно ниже.
+      </p>
+
+      <p class="field-hint">
+        «Не опознаны» — клиенты, которые дошли до прокси, но договориться с ними
+        не удалось. Почти всегда это старая ссылка: секрет в Telegram остался от
+        прошлого запуска и больше не совпадает. Тогда Telegram пишет «прокси
+        настроен неверно», а адрес такого клиента появится в журнале ниже.
       </p>
 
       <div class="log-panel">

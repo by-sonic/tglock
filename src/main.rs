@@ -53,6 +53,9 @@ struct StatusSnapshot {
     /// этой машины; не ноль — что дотянулся, и разбираться надо с адресами
     /// (by-sonic/tglock#42).
     blocked: u32,
+    /// Клиенты, которые дошли, но не сумели договориться. Почти всегда это
+    /// ссылка `tg://proxy` от прошлого запуска, то есть другой секрет.
+    unknown_clients: u32,
     uptime_seconds: u64,
     port: u16,
     /// Адрес, который нужно вписать в Telegram на другом устройстве.
@@ -124,6 +127,7 @@ impl AppState {
             failures: self.stats.ws_failures.load(Ordering::Relaxed),
             route_failures: self.stats.route_failures(),
             blocked: self.stats.blocked.load(Ordering::Relaxed),
+            unknown_clients: self.stats.unknown_clients.load(Ordering::Relaxed),
             uptime_seconds: self
                 .started_at
                 .lock()

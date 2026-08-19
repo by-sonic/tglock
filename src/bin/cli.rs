@@ -223,14 +223,15 @@ async fn watch_status(stats: Arc<proxy::Stats>) {
             stats.ws_failures.load(Ordering::Relaxed),
             stats.route_failures(),
             stats.blocked.load(Ordering::Relaxed),
+            stats.unknown_clients.load(Ordering::Relaxed),
         );
         if previous.as_ref() == Some(&current) {
             continue;
         }
-        let (active, tunnels, dc, route, failures, route_failures, blocked) = current;
+        let (active, tunnels, dc, route, failures, route_failures, blocked, unknown) = current;
         let line = format!(
             "соединений {active} · туннелей {tunnels} · {} · {} · сбоев {failures} · \
-             падений маршрутов {route_failures} · отклонено {blocked}",
+             падений маршрутов {route_failures} · отклонено {blocked} · не опознано {unknown}",
             if dc > 0 {
                 format!("DC{dc}")
             } else {
