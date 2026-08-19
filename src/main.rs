@@ -47,6 +47,12 @@ struct StatusSnapshot {
     /// Падения отдельных маршрутов. Растёт даже когда соединение в итоге
     /// состоялось через запасной адрес (by-sonic/tglock#32).
     route_failures: u32,
+    /// Запросы, отклонённые политикой «в LAN-режиме только Telegram».
+    ///
+    /// Ноль при неработающем телефоне означает, что он вообще не дотянулся до
+    /// этой машины; не ноль — что дотянулся, и разбираться надо с адресами
+    /// (by-sonic/tglock#42).
+    blocked: u32,
     uptime_seconds: u64,
     port: u16,
     /// Адрес, который нужно вписать в Telegram на другом устройстве.
@@ -102,6 +108,11 @@ impl AppState {
     }
 
     fn snapshot(&self) -> StatusSnapshot {
+        // События прокси доходят до журнала только здесь: у ядра нет своего
+        // способа что-то показать, а интерфейс и так опрашивает состояние.
+        for event in self.stats.drain_events() {
+            self.log(event, false);
+        }
         let data_center = self.stats.last_dc.load(Ordering::Relaxed);
         let route = transport::route_label(self.stats.last_route.load(Ordering::Relaxed));
         StatusSnapshot {
@@ -112,6 +123,7 @@ impl AppState {
             route: route.to_owned(),
             failures: self.stats.ws_failures.load(Ordering::Relaxed),
             route_failures: self.stats.route_failures(),
+            blocked: self.stats.blocked.load(Ordering::Relaxed),
             uptime_seconds: self
                 .started_at
                 .lock()

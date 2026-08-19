@@ -205,6 +205,16 @@ async fn watch_status(stats: Arc<proxy::Stats>) {
     let mut previous = None;
     loop {
         tokio::time::sleep(STATUS_POLL).await;
+
+        // Отдельные события — кто подключился и какой адрес отклонён. Без них
+        // journalctl показывает только счётчики, по которым нельзя отличить
+        // «телефон не дошёл» от «дошёл и получил отказ» (by-sonic/tglock#42).
+        for event in stats.drain_events() {
+            if !say(&event) {
+                return;
+            }
+        }
+
         let current = (
             stats.active.load(Ordering::Relaxed),
             stats.ws.load(Ordering::Relaxed),
@@ -212,14 +222,15 @@ async fn watch_status(stats: Arc<proxy::Stats>) {
             stats.last_route.load(Ordering::Relaxed),
             stats.ws_failures.load(Ordering::Relaxed),
             stats.route_failures(),
+            stats.blocked.load(Ordering::Relaxed),
         );
         if previous.as_ref() == Some(&current) {
             continue;
         }
-        let (active, tunnels, dc, route, failures, route_failures) = current;
+        let (active, tunnels, dc, route, failures, route_failures, blocked) = current;
         let line = format!(
             "соединений {active} · туннелей {tunnels} · {} · {} · сбоев {failures} · \
-             падений маршрутов {route_failures}",
+             падений маршрутов {route_failures} · отклонено {blocked}",
             if dc > 0 {
                 format!("DC{dc}")
             } else {

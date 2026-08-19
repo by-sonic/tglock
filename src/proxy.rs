@@ -1,5 +1,6 @@
 use crate::config::ListenConfig;
-use std::net::Ipv4Addr;
+use std::collections::{HashSet, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,14 +24,36 @@ pub struct Stats {
     pub ws: AtomicU32,
     pub last_dc: AtomicU16,
     pub ws_failures: AtomicU32,
+    /// Сколько запросов отклонено политикой «только Telegram».
+    ///
+    /// В LAN-режиме это единственный признак, отличающий «телефон не дотянулся
+    /// до компьютера» от «дотянулся, но попросил адрес, который мы не пускаем».
+    /// Раньше отказ происходил молча, и снаружи оба случая выглядели одинаково
+    /// (by-sonic/tglock#42).
+    pub blocked: AtomicU32,
     /// See `transport::RouteKind::ui_code`.
     pub last_route: AtomicU8,
     transport: crate::transport::TransportEngine,
     secret: [u8; 16],
     /// Почему секрет не удалось сохранить, если не удалось.
     secret_write_error: Option<String>,
+    events: Mutex<Events>,
     shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
+
+/// Однократные сообщения о том, что происходит с подключениями.
+///
+/// Однократные намеренно: отклонённый адрес повторяется десятки раз в минуту,
+/// и без склейки журнал превратился бы в одну строку, повторённую сто раз.
+/// Число повторов при этом не теряется — оно в счётчике `blocked`.
+#[derive(Default)]
+struct Events {
+    pending: VecDeque<String>,
+    seen: HashSet<String>,
+}
+
+/// Сколько разных событий помним, чтобы буфер не рос без границы.
+const EVENT_LIMIT: usize = 64;
 
 impl Stats {
     pub fn new() -> Arc<Self> {
@@ -67,12 +90,47 @@ impl Stats {
             ws: AtomicU32::new(0),
             last_dc: AtomicU16::new(0),
             ws_failures: AtomicU32::new(0),
+            blocked: AtomicU32::new(0),
             last_route: AtomicU8::new(0),
             transport: crate::transport::TransportEngine::new(),
             secret,
             secret_write_error,
+            events: Mutex::new(Events::default()),
             shutdown: Mutex::new(None),
         })
+    }
+
+    /// Запомнить событие, если такого ещё не было.
+    pub fn note(&self, message: impl Into<String>) {
+        let message = message.into();
+        let mut events = self.events.lock().unwrap();
+        if events.seen.len() >= EVENT_LIMIT || !events.seen.insert(message.clone()) {
+            return;
+        }
+        events.pending.push_back(message);
+    }
+
+    /// Забрать накопившиеся события. Показывает их GUI или CLI — тот, кто есть.
+    pub fn drain_events(&self) -> Vec<String> {
+        self.events.lock().unwrap().pending.drain(..).collect()
+    }
+
+    fn note_blocked(&self, destination: &str, port: u16) {
+        self.blocked.fetch_add(1, Ordering::Relaxed);
+        self.note(format!(
+            "Отклонено: {destination}:{port} — адрес не из сетей Telegram"
+        ));
+    }
+
+    /// Отметить, что до прокси дотянулось устройство из сети, а не с этой машины.
+    ///
+    /// Это первое, что нужно знать при разборе LAN-режима: если строки нет,
+    /// телефон до компьютера не дошёл, и дело в сети, а не в TGLock.
+    fn note_peer(&self, peer: SocketAddr) {
+        if peer.ip().is_loopback() {
+            return;
+        }
+        self.note(format!("Подключилось устройство из сети: {}", peer.ip()));
     }
 
     pub fn telegram_secret(&self) -> String {
@@ -149,8 +207,9 @@ pub async fn serve(
         tokio::select! {
             result = listener.accept() => {
                 match result {
-                    Ok((stream, _)) => {
+                    Ok((stream, peer)) => {
                         let s = stats.clone();
+                        s.note_peer(peer);
                         s.active.fetch_add(1, Ordering::Relaxed);
                         s.total.fetch_add(1, Ordering::Relaxed);
                         tasks.spawn(async move {
@@ -243,6 +302,33 @@ async fn detect_protocol(
     }
 }
 
+/// Куда просится SOCKS5-клиент и что с этим делать.
+#[derive(Debug, Eq, PartialEq)]
+enum Destination {
+    /// Адрес дата-центра Telegram: дальше идёт MTProto, его заворачиваем в
+    /// WebSocket — ради этого TGLock и существует.
+    DataCentre(IpAddr),
+    /// Имя из веб-инфраструктуры Telegram. Это обычный HTTPS, а не MTProto:
+    /// клиент ходит сюда за конфигурацией, превью и файлами CDN. Заворачивать
+    /// такое соединение в MTProto-туннель нельзя, его нужно пропустить как есть.
+    ///
+    /// На телефоне эти запросы идут через тот же прокси, поэтому в LAN-режиме
+    /// они разрешены — иначе клиент не может даже дочитать свою конфигурацию.
+    TelegramWeb,
+    /// Всё остальное. На loopback пропускается напрямую, на сетевом адресе —
+    /// отклоняется, иначе LAN-режим стал бы открытым прокси.
+    Elsewhere,
+}
+
+fn classify(address: &str) -> Destination {
+    match address.parse::<IpAddr>() {
+        Ok(ip) if crate::telegram_net::is_telegram(ip) => Destination::DataCentre(ip),
+        Ok(_) => Destination::Elsewhere,
+        Err(_) if crate::telegram_net::is_telegram_host(address) => Destination::TelegramWeb,
+        Err(_) => Destination::Elsewhere,
+    }
+}
+
 async fn handle_socks5(
     mut s: TcpStream,
     stats: &Stats,
@@ -253,8 +339,9 @@ async fn handle_socks5(
     let (addr, port) = tokio::time::timeout(IO_TIMEOUT, read_socks5_request(&mut s))
         .await
         .map_err(|_| "SOCKS5 handshake timeout")??;
-    let tg = addr.parse::<Ipv4Addr>().ok().and_then(dc_from_ip).is_some();
-    if !tg && !allow_direct {
+    let destination = classify(&addr);
+    if destination == Destination::Elsewhere && !allow_direct {
+        stats.note_blocked(&addr, port);
         write_socks_reply(&mut s, 0x02).await?;
         return Err("LAN mode only permits Telegram destinations".into());
     }
@@ -263,17 +350,13 @@ async fn handle_socks5(
     s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x04, 0x38])
         .await?;
 
-    if tg {
+    if let Destination::DataCentre(ip) = destination {
         // Read 64-byte obfuscated2 init → extract real DC
         let mut init = [0u8; 64];
         s.read_exact(&mut init).await?;
 
-        let (dc, media) = dc_from_init(&init).unwrap_or_else(|| {
-            addr.parse::<Ipv4Addr>()
-                .ok()
-                .and_then(dc_from_ip)
-                .map_or((2, false), |dc| (dc, false))
-        });
+        let (dc, media) = dc_from_init(&init)
+            .unwrap_or_else(|| (crate::telegram_net::dc_from_ip(ip).unwrap_or(2), false));
 
         stats.last_dc.store(dc, Ordering::Relaxed);
 
@@ -284,13 +367,68 @@ async fn handle_socks5(
         }
         r?;
     } else {
-        let remote = tokio::time::timeout(IO_TIMEOUT, TcpStream::connect((addr.as_str(), port)))
+        let remote = tokio::time::timeout(IO_TIMEOUT, connect_direct(&addr, port, allow_direct))
             .await
             .map_err(|_| "direct connection timeout")??;
         let _ = remote.set_nodelay(true);
         tcp_relay(s, remote).await;
     }
     Ok(())
+}
+
+/// Открыть прямое соединение по адресу, который назвал клиент.
+///
+/// В ограниченном режиме имя разрешается заранее и проверяется, куда оно
+/// указывает: список доменов принадлежит Telegram, но DNS-ответ приходит извне,
+/// а адрес назначения выбирает чужое устройство. Без проверки ответ вида
+/// `127.0.0.1` или `192.168.0.1` сделал бы TGLock дверью во внутреннюю сеть
+/// этой машины.
+async fn connect_direct(
+    address: &str,
+    port: u16,
+    allow_direct: bool,
+) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync>> {
+    if allow_direct {
+        return Ok(TcpStream::connect((address, port)).await?);
+    }
+
+    let mut last = None;
+    for candidate in tokio::net::lookup_host((address, port)).await? {
+        if is_private(candidate.ip()) {
+            continue;
+        }
+        match TcpStream::connect(candidate).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(match last {
+        Some(error) => Box::new(error) as Box<dyn std::error::Error + Send + Sync>,
+        None => format!("{address} resolves only to addresses inside this network").into(),
+    })
+}
+
+fn is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+                || ip.octets()[0] == 0
+                // 100.64.0.0/10, операторский NAT
+                || (ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                // fc00::/7 — уникальные локальные, fe80::/10 — link-local
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+                || ip.to_ipv4_mapped().is_some_and(|ip| is_private(IpAddr::V4(ip)))
+        }
+    }
 }
 
 async fn handle_mtproto(
@@ -405,28 +543,6 @@ fn dc_from_init(init: &[u8; 64]) -> Option<(u16, bool)> {
     let id = i16::from_le_bytes([dec[60], dec[61]]);
     let dc = id.unsigned_abs();
     matches!(dc, 1..=5 | 203).then_some((dc, id < 0))
-}
-
-fn dc_from_ip(ip: Ipv4Addr) -> Option<u16> {
-    let o = ip.octets();
-    match (o[0], o[1]) {
-        (149, 154) => Some(match o[2] {
-            160..=163 => 1,
-            164..=167 => 2,
-            168..=171 => 3,
-            172..=175 => 1,
-            _ => 2,
-        }),
-        (91, 108) => Some(match o[2] {
-            56..=59 => 5,
-            8..=11 => 3,
-            12..=15 => 4,
-            _ => 2,
-        }),
-        (91, 105) if o[2] == 192 => Some(203),
-        (91, 105) | (185, 76) => Some(2),
-        _ => None,
-    }
 }
 
 // -- WebSocket tunnel -------------------------------------------------------
@@ -696,12 +812,51 @@ mod tests {
         assert!(server_task.await.unwrap());
     }
 
+    /// Что именно решает судьбу соединения в LAN-режиме.
+    ///
+    /// Принадлежность адреса сетям Telegram проверяется в `telegram_net`;
+    /// здесь важно, что из неё следует для каждой из трёх веток.
     #[test]
-    fn maps_known_telegram_networks_to_dc() {
-        assert_eq!(dc_from_ip("149.154.160.1".parse().unwrap()), Some(1));
-        assert_eq!(dc_from_ip("149.154.167.255".parse().unwrap()), Some(2));
-        assert_eq!(dc_from_ip("91.108.58.1".parse().unwrap()), Some(5));
-        assert_eq!(dc_from_ip("1.1.1.1".parse().unwrap()), None);
+    fn destinations_are_sorted_into_three_kinds() {
+        assert_eq!(
+            classify("149.154.167.51"),
+            Destination::DataCentre("149.154.167.51".parse().unwrap())
+        );
+        assert_eq!(
+            classify("2001:67c:4e8:f002::a"),
+            Destination::DataCentre("2001:67c:4e8:f002::a".parse().unwrap()),
+            "IPv6-адрес дата-центра — такой же Telegram (by-sonic/tglock#42)"
+        );
+        assert_eq!(classify("web.telegram.org"), Destination::TelegramWeb);
+        assert_eq!(classify("1.1.1.1"), Destination::Elsewhere);
+        assert_eq!(
+            classify("185.76.150.1"),
+            Destination::Elsewhere,
+            "соседний адрес вне опубликованного блока Telegram"
+        );
+        assert_eq!(classify("telegram.org.example.com"), Destination::Elsewhere);
+    }
+
+    #[test]
+    fn a_refused_destination_is_counted_and_named_once() {
+        let stats = Stats::new();
+        for _ in 0..3 {
+            stats.note_blocked("1.1.1.1", 443);
+        }
+        stats.note_blocked("8.8.8.8", 443);
+
+        assert_eq!(
+            stats.blocked.load(Ordering::Relaxed),
+            4,
+            "счётчик считает все отказы"
+        );
+        let events = stats.drain_events();
+        assert_eq!(events.len(), 2, "а журнал называет каждый адрес один раз");
+        assert!(events[0].contains("1.1.1.1:443"), "{events:?}");
+        assert!(
+            stats.drain_events().is_empty(),
+            "забранное событие не приходит повторно"
+        );
     }
 
     #[tokio::test]
@@ -873,6 +1028,42 @@ mod tests {
             reply[1], 0x02,
             "a shared listener must not relay arbitrary destinations"
         );
+        assert_eq!(
+            stats.blocked.load(Ordering::Relaxed),
+            1,
+            "отказ должен быть виден в диагностике, а не только клиенту"
+        );
+        assert!(
+            stats
+                .drain_events()
+                .iter()
+                .any(|event| event.contains("1.1.1.1:443")),
+            "в журнале должен быть назван адрес, из-за которого отказали"
+        );
+
+        stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    /// Ровно то, на чём ломался LAN-режим: телефон просит адрес дата-центра по
+    /// IPv6, а прокси отвечает «не Telegram» (by-sonic/tglock#42).
+    #[tokio::test]
+    async fn network_listener_accepts_a_telegram_ipv6_data_centre() {
+        let stats = Stats::new();
+        let (port, server) = start_proxy(stats.clone(), false).await;
+
+        let mut request = vec![0x05, 0x01, 0x00, 0x04];
+        request.extend_from_slice(
+            &"2001:67c:4e8:f002::a"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        request.extend_from_slice(&443_u16.to_be_bytes());
+
+        let (_client, reply) = socks5_exchange(port, &request).await;
+        assert_eq!(reply[1], 0x00, "адрес Telegram по IPv6 нельзя отклонять");
+        assert_eq!(stats.blocked.load(Ordering::Relaxed), 0);
 
         stats.stop();
         let _ = server.await.unwrap();
