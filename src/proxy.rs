@@ -1,7 +1,7 @@
 use crate::config::ListenConfig;
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -22,7 +22,9 @@ pub struct Stats {
     pub active: AtomicU32,
     pub total: AtomicU32,
     pub ws: AtomicU32,
-    pub last_dc: AtomicU16,
+    /// DC последнего разобранного соединения. Показывается, пока туннеля ещё
+    /// нет: клиент уже понят, маршрут ещё не выбран.
+    seen_dc: AtomicU16,
     pub ws_failures: AtomicU32,
     /// Сколько запросов отклонено политикой «только Telegram».
     ///
@@ -37,8 +39,19 @@ pub struct Stats {
     /// прошлого запуска. Такое соединение закрывалось молча, и по диагностике
     /// отличить его от рабочего было нельзя.
     pub unknown_clients: AtomicU32,
-    /// See `transport::RouteKind::ui_code`.
-    pub last_route: AtomicU8,
+    /// DC и маршрут последнего поднятого туннеля, упакованные в одно значение.
+    ///
+    /// Раньше это были два независимых поля: номер писало соединение при
+    /// разборе init, маршрут — другое соединение после рукопожатия. При
+    /// нескольких десятках одновременных соединений пара в строке статуса
+    /// складывалась из разных из них, и читалась она как «до этого DC шли
+    /// этим маршрутом», хотя означала совсем не это. У DC1, DC3, DC5 и DC203
+    /// закреплённый адрес всего один, и «запасного» у них не бывает вовсе —
+    /// а строки `DC5 · Запасной Telegram IP` в диагностике встречались
+    /// (by-sonic/tglock#42).
+    ///
+    /// Формат: `dc << 8 | route`, где route — `transport::RouteKind::ui_code`.
+    last_tunnel: AtomicU32,
     transport: crate::transport::TransportEngine,
     secret: [u8; 16],
     /// Почему секрет не удалось сохранить, если не удалось.
@@ -94,11 +107,11 @@ impl Stats {
             active: AtomicU32::new(0),
             total: AtomicU32::new(0),
             ws: AtomicU32::new(0),
-            last_dc: AtomicU16::new(0),
+            seen_dc: AtomicU16::new(0),
             ws_failures: AtomicU32::new(0),
             blocked: AtomicU32::new(0),
             unknown_clients: AtomicU32::new(0),
-            last_route: AtomicU8::new(0),
+            last_tunnel: AtomicU32::new(0),
             transport: crate::transport::TransportEngine::new(),
             secret,
             secret_write_error,
@@ -152,6 +165,34 @@ impl Stats {
             return;
         }
         self.note(format!("Подключилось устройство из сети: {}", peer.ip()));
+    }
+
+    /// Запомнить DC, с которым пришёл клиент. Туннеля может ещё не быть.
+    fn note_dc(&self, dc: u16) {
+        self.seen_dc.store(dc, Ordering::Relaxed);
+    }
+
+    /// Запомнить, каким маршрутом поднялся туннель и до какого DC.
+    ///
+    /// Пишется одним значением, чтобы пара в диагностике всегда была из
+    /// одного соединения.
+    fn note_tunnel(&self, dc: u16, route: u8) {
+        self.last_tunnel
+            .store(u32::from(dc) << 8 | u32::from(route), Ordering::Relaxed);
+    }
+
+    /// Номер дата-центра для показа: из последнего поднятого туннеля, а пока
+    /// туннеля не было — из последнего разобранного соединения.
+    pub fn last_dc(&self) -> u16 {
+        match self.last_tunnel.load(Ordering::Relaxed) {
+            0 => self.seen_dc.load(Ordering::Relaxed),
+            packed => (packed >> 8) as u16,
+        }
+    }
+
+    /// Маршрут последнего поднятого туннеля. См. `transport::RouteKind::ui_code`.
+    pub fn last_route(&self) -> u8 {
+        (self.last_tunnel.load(Ordering::Relaxed) & 0xff) as u8
     }
 
     pub fn telegram_secret(&self) -> String {
@@ -388,7 +429,7 @@ async fn handle_socks5(
         let (dc, media) = dc_from_init(&init)
             .unwrap_or_else(|| (crate::telegram_net::dc_from_ip(ip).unwrap_or(2), false));
 
-        stats.last_dc.store(dc, Ordering::Relaxed);
+        stats.note_dc(dc);
 
         let r = ws_tunnel(s, dc, media, &init, None, stats).await;
 
@@ -486,7 +527,7 @@ async fn handle_mtproto(
         }
     };
 
-    stats.last_dc.store(parsed.dc, Ordering::Relaxed);
+    stats.note_dc(parsed.dc);
     let result = ws_tunnel(
         stream,
         parsed.dc,
@@ -624,9 +665,7 @@ async fn ws_tunnel(
 
     let (mut ws, connected) = stats.transport.connect(dc, media).await?;
     let _tunnel = EstablishedTunnel::new(stats);
-    stats
-        .last_route
-        .store(connected.route.kind.ui_code(), Ordering::Relaxed);
+    stats.note_tunnel(dc, connected.route.kind.ui_code());
 
     let (mut tcp_r, mut tcp_w) = tokio::io::split(tcp);
 
@@ -902,6 +941,35 @@ mod tests {
         );
     }
 
+    /// Диагностика обязана показывать пару из одного соединения.
+    ///
+    /// Пока это были два независимых поля, при десятках одновременных
+    /// соединений в строку статуса попадали номер от одного и маршрут от
+    /// другого. Читалось это как «до DC5 шли запасным адресом», хотя у DC5
+    /// закреплённый адрес всего один и запасного не бывает вовсе
+    /// (by-sonic/tglock#42).
+    #[test]
+    fn the_reported_data_centre_and_route_come_from_the_same_tunnel() {
+        let stats = Stats::new();
+        assert_eq!(stats.last_dc(), 0, "до соединений показывать нечего");
+        assert_eq!(stats.last_route(), 0);
+
+        stats.note_dc(2);
+        assert_eq!(stats.last_dc(), 2, "клиент разобран, номер известен");
+        assert_eq!(stats.last_route(), 0, "а маршрут ещё не выбран");
+
+        stats.note_tunnel(4, 2);
+        assert_eq!((stats.last_dc(), stats.last_route()), (4, 2));
+
+        // Ещё одно соединение до другого DC, туннеля у него пока нет.
+        stats.note_dc(203);
+        assert_eq!(
+            (stats.last_dc(), stats.last_route()),
+            (4, 2),
+            "пара обязана остаться от соединения, у которого туннель был"
+        );
+    }
+
     /// Клиент с сохранённой ссылкой от прошлого запуска. Раньше его соединение
     /// закрывалось молча, и по диагностике это было неотличимо от рабочего.
     #[tokio::test]
@@ -1080,7 +1148,7 @@ mod tests {
         // Detection must land on MTProto, which records the data centre. The
         // SOCKS5 path would instead answer with a handshake reply.
         wait_until("the MTProto data centre to be recorded", || {
-            stats.last_dc.load(Ordering::Relaxed) == 2
+            stats.last_dc() == 2
         })
         .await;
 
@@ -1233,9 +1301,9 @@ mod tests {
             "Telegram must receive exactly the client's plaintext"
         );
 
-        assert_eq!(stats.last_dc.load(Ordering::Relaxed), 4);
+        assert_eq!(stats.last_dc(), 4);
         assert_eq!(
-            stats.last_route.load(Ordering::Relaxed),
+            stats.last_route(),
             crate::transport::RouteKind::TelegramIp.ui_code()
         );
         assert_eq!(stats.ws_failures.load(Ordering::Relaxed), 0);
@@ -1290,7 +1358,7 @@ mod tests {
         );
         assert_eq!(relayed, request);
         assert_eq!(
-            stats.last_route.load(Ordering::Relaxed),
+            stats.last_route(),
             crate::transport::RouteKind::CloudflareWorker.ui_code()
         );
 
@@ -1318,10 +1386,7 @@ mod tests {
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         client.write_all(&init).await.unwrap();
 
-        wait_until("the init to be parsed", || {
-            stats.last_dc.load(Ordering::Relaxed) == 2
-        })
-        .await;
+        wait_until("the init to be parsed", || stats.last_dc() == 2).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert_eq!(
@@ -1330,7 +1395,7 @@ mod tests {
             "a handshake still in flight must not be reported as a working tunnel"
         );
         assert_eq!(
-            stats.last_route.load(Ordering::Relaxed),
+            stats.last_route(),
             0,
             "no route may be announced before a tunnel is established"
         );
@@ -1359,7 +1424,7 @@ mod tests {
         })
         .await;
         assert_eq!(
-            stats.last_route.load(Ordering::Relaxed),
+            stats.last_route(),
             0,
             "a route must not be reported as working when every attempt failed"
         );
@@ -1389,13 +1454,13 @@ mod tests {
         client.write_all(&init).await.unwrap();
 
         tokio::time::timeout(Duration::from_secs(10), async {
-            while stats.last_route.load(Ordering::Relaxed) == 0 {
+            while stats.last_route() == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(stats.last_dc.load(Ordering::Relaxed), 4);
+        assert_eq!(stats.last_dc(), 4);
         assert_eq!(stats.ws_failures.load(Ordering::Relaxed), 0);
 
         stats.stop();
