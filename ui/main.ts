@@ -11,6 +11,8 @@ type Status = {
   route: string;
   failures: number;
   routeFailures: number;
+  /// Отклонено политикой «в LAN-режиме только Telegram».
+  blocked: number;
   uptimeSeconds: number;
   port: number;
   /// Адрес для других устройств. Приходит только в LAN-режиме.
@@ -41,6 +43,7 @@ let status: Status = {
   route: "Маршрут ещё не выбран",
   failures: 0,
   routeFailures: 0,
+  blocked: 0,
   uptimeSeconds: 0,
   port: 1080,
   shareAddress: null,
@@ -283,12 +286,23 @@ function renderDiagnostics(): void {
           <span>Падений маршрутов</span>
           <strong>${status.routeFailures}</strong>
         </article>
+        <article class="metric-card">
+          <span>Отклонено</span>
+          <strong>${status.blocked}</strong>
+        </article>
       </div>
 
       <p class="field-hint">
         «Падений маршрутов» больше нуля при работающем Telegram — это норма:
         значит закреплённый адрес недоступен и подключение идёт через запасной.
         Число в багрепорте помогает понять, что именно перебиралось.
+      </p>
+
+      <p class="field-hint">
+        «Отклонено» — запросы, которые LAN-режим не пропустил: он ходит только
+        по адресам Telegram. Если с телефона ничего не работает, а здесь ноль и
+        соединений тоже ноль, значит телефон до этого компьютера не дошёл —
+        дело в сети или брандмауэре. Какие именно адреса отклонены, видно ниже.
       </p>
 
       <div class="log-panel">

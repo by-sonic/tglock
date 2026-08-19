@@ -8,6 +8,7 @@
 pub mod config;
 pub mod mtproto;
 pub mod proxy;
+pub mod telegram_net;
 pub mod transport;
 
 /// Настройки headless-версии: файл конфигурации и сведение с флагами.
