@@ -31,6 +31,12 @@ pub struct Stats {
     /// Раньше отказ происходил молча, и снаружи оба случая выглядели одинаково
     /// (by-sonic/tglock#42).
     pub blocked: AtomicU32,
+    /// Сколько клиентов дошло до прокси, но не сумело договориться.
+    ///
+    /// Почти всегда это несовпадение секрета: в Telegram вписана ссылка от
+    /// прошлого запуска. Такое соединение закрывалось молча, и по диагностике
+    /// отличить его от рабочего было нельзя.
+    pub unknown_clients: AtomicU32,
     /// See `transport::RouteKind::ui_code`.
     pub last_route: AtomicU8,
     transport: crate::transport::TransportEngine,
@@ -91,6 +97,7 @@ impl Stats {
             last_dc: AtomicU16::new(0),
             ws_failures: AtomicU32::new(0),
             blocked: AtomicU32::new(0),
+            unknown_clients: AtomicU32::new(0),
             last_route: AtomicU8::new(0),
             transport: crate::transport::TransportEngine::new(),
             secret,
@@ -120,6 +127,20 @@ impl Stats {
         self.note(format!(
             "Отклонено: {destination}:{port} — адрес не из сетей Telegram"
         ));
+    }
+
+    /// Клиент дошёл, но договориться с ним не удалось.
+    ///
+    /// Раньше такое соединение закрывалось молча: `active` дёргался вверх и
+    /// обратно, и всё. По диагностике это неотличимо от «клиент подключился и
+    /// работает», хотя означает противоположное (by-sonic/tglock#42).
+    fn note_unknown_client(&self, peer: Option<SocketAddr>, reason: &str) {
+        self.unknown_clients.fetch_add(1, Ordering::Relaxed);
+        let who = match peer {
+            Some(peer) => peer.ip().to_string(),
+            None => "неизвестный адрес".to_owned(),
+        };
+        self.note(format!("Клиент {who}: {reason}"));
     }
 
     /// Отметить, что до прокси дотянулось устройство из сети, а не с этой машины.
@@ -335,10 +356,19 @@ async fn handle_socks5(
     allow_direct: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     s.set_nodelay(true)?;
+    let peer = s.peer_addr().ok();
 
-    let (addr, port) = tokio::time::timeout(IO_TIMEOUT, read_socks5_request(&mut s))
+    let request = tokio::time::timeout(IO_TIMEOUT, read_socks5_request(&mut s))
         .await
-        .map_err(|_| "SOCKS5 handshake timeout")??;
+        .map_err(|_| "SOCKS5 handshake timeout".to_owned())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    let (addr, port) = match request {
+        Ok(request) => request,
+        Err(error) => {
+            stats.note_unknown_client(peer, &format!("SOCKS5-приветствие не разобрано ({error})"));
+            return Err(error.into());
+        }
+    };
     let destination = classify(&addr);
     if destination == Destination::Elsewhere && !allow_direct {
         stats.note_blocked(&addr, port);
@@ -436,12 +466,25 @@ async fn handle_mtproto(
     stats: &Stats,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true)?;
+    let peer = stream.peer_addr().ok();
     let mut init = [0; 64];
     tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut init))
         .await
         .map_err(|_| "MTProto init timeout")??;
-    let parsed = crate::mtproto::parse_client_init(&init, &stats.secret)
-        .ok_or("invalid MTProto init or secret")?;
+    let parsed = match crate::mtproto::parse_client_init(&init, &stats.secret) {
+        Some(parsed) => parsed,
+        None => {
+            // Секрет — половина ссылки `tg://proxy`. Клиент с сохранённой
+            // ссылкой от прошлого запуска попадает ровно сюда, и Telegram
+            // показывает ему «прокси настроен неверно».
+            stats.note_unknown_client(
+                peer,
+                "MTProto-init не разобран. Скорее всего в Telegram вписан другой \
+                 секрет — сверьте ссылку tg://proxy с той, что показана сейчас",
+            );
+            return Err("invalid MTProto init or secret".into());
+        }
+    };
 
     stats.last_dc.store(parsed.dc, Ordering::Relaxed);
     let result = ws_tunnel(
@@ -857,6 +900,56 @@ mod tests {
             stats.drain_events().is_empty(),
             "забранное событие не приходит повторно"
         );
+    }
+
+    /// Клиент с сохранённой ссылкой от прошлого запуска. Раньше его соединение
+    /// закрывалось молча, и по диагностике это было неотличимо от рабочего.
+    #[tokio::test]
+    async fn a_client_with_the_wrong_secret_gets_named_instead_of_dropped_in_silence() {
+        let stats = Stats::new();
+        let (port, server) = start_proxy(stats.clone(), true).await;
+
+        let stranger = crate::mtproto::generate_secret();
+        let init = unambiguous_client_init(&stranger, 2);
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(&init).await.unwrap();
+
+        wait_until("отказ по секрету", || {
+            stats.unknown_clients.load(Ordering::Relaxed) > 0
+        })
+        .await;
+        let events = stats.drain_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("MTProto-init не разобран")),
+            "в журнале должно быть сказано, что init не разобран: {events:?}"
+        );
+
+        stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_client_that_speaks_neither_protocol_is_counted_too() {
+        let stats = Stats::new();
+        let (port, server) = start_proxy(stats.clone(), true).await;
+
+        // Приветствие SOCKS5 с нулём методов: разбор обязан провалиться.
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(&[0x05, 0x00]).await.unwrap();
+
+        wait_until("отказ по рукопожатию", || {
+            stats.unknown_clients.load(Ordering::Relaxed) > 0
+        })
+        .await;
+        assert!(stats
+            .drain_events()
+            .iter()
+            .any(|event| event.contains("SOCKS5-приветствие не разобрано")));
+
+        stats.stop();
+        let _ = server.await.unwrap();
     }
 
     #[tokio::test]
