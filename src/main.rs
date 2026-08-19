@@ -116,8 +116,8 @@ impl AppState {
         for event in self.stats.drain_events() {
             self.log(event, false);
         }
-        let data_center = self.stats.last_dc.load(Ordering::Relaxed);
-        let route = transport::route_label(self.stats.last_route.load(Ordering::Relaxed));
+        let data_center = self.stats.last_dc();
+        let route = transport::route_label(self.stats.last_route());
         StatusSnapshot {
             running: self.stats.running.load(Ordering::SeqCst),
             active_connections: self.stats.active.load(Ordering::Relaxed),

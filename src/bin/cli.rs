@@ -218,8 +218,8 @@ async fn watch_status(stats: Arc<proxy::Stats>) {
         let current = (
             stats.active.load(Ordering::Relaxed),
             stats.ws.load(Ordering::Relaxed),
-            stats.last_dc.load(Ordering::Relaxed),
-            stats.last_route.load(Ordering::Relaxed),
+            stats.last_dc(),
+            stats.last_route(),
             stats.ws_failures.load(Ordering::Relaxed),
             stats.route_failures(),
             stats.blocked.load(Ordering::Relaxed),
