@@ -26,6 +26,7 @@ impl Default for Settings {
             lan_mode: false,
             port: proxy::DEFAULT_PORT,
             worker_domain: String::new(),
+            secret: None,
         }
     }
 }
@@ -558,8 +559,9 @@ mod tests {
 
     #[test]
     fn file_backed_secret_survives_restarts() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let secret_path = dir.path().join("secret");
+        let dir = std::env::temp_dir().join(format!("tglock-secret-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let secret_path = dir.join("secret");
         let settings = Settings::default();
         let first = build_stats(&settings, &secret_path);
         let second = build_stats(&settings, &secret_path);
@@ -572,6 +574,7 @@ mod tests {
             first.secret_write_error().is_none(),
             "fresh tempdir must allow writing the secret"
         );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
