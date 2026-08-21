@@ -19,6 +19,12 @@ type Status = {
   port: number;
   /// Адрес для других устройств. Приходит только в LAN-режиме.
   shareAddress: string | null;
+  /// Полная ссылка tg://proxy для подключения Telegram.
+  telegramLink: string | null;
+  /// Секрет сохранён и не изменится после перезапуска.
+  secretPersistent: boolean;
+  /// Почему секрет не записался на диск.
+  secretWriteError: string | null;
   logs: LogLine[];
 };
 
@@ -32,6 +38,7 @@ type Settings = {
   lanMode: boolean;
   port: number;
   workerDomain: string;
+  secret?: string | null;
 };
 
 const root = document.querySelector<HTMLDivElement>("#app")!;
@@ -50,6 +57,9 @@ let status: Status = {
   uptimeSeconds: 0,
   port: 1080,
   shareAddress: null,
+  telegramLink: null,
+  secretPersistent: true,
+  secretWriteError: null,
   logs: [],
 };
 let settings: Settings = { lanMode: false, port: 1080, workerDomain: "" };
@@ -156,6 +166,27 @@ function renderHome(): void {
         <span>порт ${status.port}</span>
       </div>
 
+      ${status.secretWriteError || !status.secretPersistent ? `
+      <div class="notice-card warning">
+        <strong>Секрет не сохранён</strong>
+        <p>${status.secretWriteError
+          ? escapeHtml(status.secretWriteError)
+          : "После перезапуска ссылка tg://proxy изменится, и Telegram откажет старой."}</p>
+        <p class="field-hint">Закрепите секрет в настройках или проверьте права на папку приложения.</p>
+      </div>` : ""}
+
+      ${status.telegramLink ? `
+      <div class="share-card">
+        <div class="share-label">Ссылка для Telegram</div>
+        <button id="copy-link" class="share-address" title="Нажмите, чтобы скопировать">
+          ${escapeHtml(status.telegramLink)}
+        </button>
+        <div class="share-hint">
+          Откройте её в Telegram на этом или другом устройстве. Если прокси «настроен неверно» —
+          скопируйте ссылку заново: секрет мог измениться после прошлого запуска.
+        </div>
+      </div>` : ""}
+
       ${status.shareAddress ? `
       <div class="share-card">
         <div class="share-label">Адрес для других устройств</div>
@@ -183,6 +214,7 @@ function renderHome(): void {
   `, "home-page");
 
   document.querySelector("#power")?.addEventListener("click", toggleProtection);
+  document.querySelector("#copy-link")?.addEventListener("click", copyTelegramLink);
   document.querySelector("#copy-address")?.addEventListener("click", copyShareAddress);
   document.querySelector("#settings-nav")?.addEventListener("click", () => navigate("settings"));
   document.querySelector("#diagnostics-nav")?.addEventListener("click", () => navigate("diagnostics"));
@@ -218,6 +250,24 @@ function renderSettings(): void {
             ${status.running ? "disabled" : ""}
           />
           <p class="field-hint">Необязательно. Используется как резервный маршрут.</p>
+        </div>
+
+        <div class="setting-card">
+          <label class="field-label" for="secret">Секрет прокси</label>
+          <input
+            id="secret"
+            name="secret"
+            type="text"
+            value="${escapeHtml(settings.secret ?? "")}"
+            placeholder="dd… или 32 hex (необязательно)"
+            autocomplete="off"
+            spellcheck="false"
+            ${status.running ? "disabled" : ""}
+          />
+          <p class="field-hint">
+            Пусто — секрет хранится в файле рядом с настройками. Закрепите вручную, если Telegram
+            отвергает прокси после перезапуска.
+          </p>
         </div>
 
         <div class="setting-list">
@@ -384,9 +434,10 @@ async function saveSettings(event: Event): Promise<void> {
   event.preventDefault();
   if (busy || status.running) return;
   const worker = document.querySelector<HTMLInputElement>("#worker");
+  const secret = document.querySelector<HTMLInputElement>("#secret");
   const lanMode = document.querySelector<HTMLInputElement>("#lan-mode");
   const port = document.querySelector<HTMLInputElement>("#port");
-  if (!worker || !lanMode || !port) return;
+  if (!worker || !secret || !lanMode || !port) return;
 
   const parsedPort = Number(port.value);
   if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
@@ -399,6 +450,7 @@ async function saveSettings(event: Event): Promise<void> {
     workerDomain: worker.value.trim(),
     lanMode: lanMode.checked,
     port: parsedPort,
+    secret: secret.value.trim() || null,
   };
   renderSettings();
   try {
@@ -409,6 +461,17 @@ async function saveSettings(event: Event): Promise<void> {
     showToast(String(error), true);
   } finally {
     busy = false;
+  }
+}
+
+async function copyTelegramLink(): Promise<void> {
+  const link = status.telegramLink;
+  if (!link) return;
+  try {
+    await navigator.clipboard.writeText(link);
+    showToast("Ссылка скопирована");
+  } catch {
+    showToast("Скопируйте ссылку вручную", true);
   }
 }
 

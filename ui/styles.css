@@ -897,3 +897,28 @@ input:disabled {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
 }
+
+.notice-card {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  text-align: left;
+}
+
+.notice-card.warning {
+  background: rgba(255, 191, 91, 0.1);
+  border: 1px solid rgba(255, 191, 91, 0.35);
+}
+
+.notice-card strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+
+.notice-card p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-muted, #8b949e);
+}
