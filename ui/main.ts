@@ -81,6 +81,19 @@ function escapeHtml(value: string): string {
     .replaceAll('"', "&quot;");
 }
 
+function formatTelegramLinkPreview(link: string): string {
+  const match = link.match(/^tg:\/\/proxy\?server=([^&]+)&port=(\d+)&secret=([a-f0-9]+)$/i);
+  if (match) {
+    const [, server, port, secret] = match;
+    const secretPreview = secret.length > 10 ? `${secret.slice(0, 2)}…${secret.slice(-6)}` : secret;
+    return `${server}:${port} · secret ${secretPreview}`;
+  }
+  if (link.length > 48) {
+    return `${link.slice(0, 22)}…${link.slice(-14)}`;
+  }
+  return link;
+}
+
 function formatUptime(seconds: number): string {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
@@ -176,15 +189,17 @@ function renderHome(): void {
       </div>` : ""}
 
       ${status.telegramLink ? `
-      <div class="share-card">
-        <div class="share-label">Ссылка для Telegram</div>
-        <button id="copy-link" class="share-address" title="Нажмите, чтобы скопировать">
-          ${escapeHtml(status.telegramLink)}
-        </button>
-        <div class="share-hint">
-          Откройте её в Telegram на этом или другом устройстве. Если прокси «настроен неверно» —
-          скопируйте ссылку заново: секрет мог измениться после прошлого запуска.
+      <div class="proxy-link-card">
+        <div class="proxy-link-head">
+          <span class="proxy-link-label">Ссылка для Telegram</span>
+          <button id="copy-link" type="button" class="copy-chip">Копировать</button>
         </div>
+        <div class="proxy-link-preview" title="${escapeHtml(status.telegramLink)}">
+          ${escapeHtml(formatTelegramLinkPreview(status.telegramLink))}
+        </div>
+        <p class="proxy-link-hint">${status.secretPersistent
+          ? "Вставьте ссылку в Telegram или откройте её на телефоне."
+          : "Секрет может меняться — скопируйте ссылку заново после перезапуска."}</p>
       </div>` : ""}
 
       ${status.shareAddress ? `
