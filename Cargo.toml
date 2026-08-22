@@ -6,6 +6,7 @@ rust-version = "1.88"
 description = "Telegram unblock via local WebSocket tunnel"
 license = "MIT"
 autobins = false
+default-run = "tglock"
 
 [features]
 default = ["gui"]

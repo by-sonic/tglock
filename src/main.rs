@@ -1,13 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Manager, State};
 use tglock::config::ListenConfig;
-use tglock::{proxy, transport};
+use tglock::{mtproto, proxy, transport};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -15,6 +15,9 @@ struct Settings {
     lan_mode: bool,
     port: u16,
     worker_domain: String,
+    /// Зафиксированный секрет прокси (32 hex или dd…). Пусто — из файла secret рядом с settings.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret: Option<String>,
 }
 
 impl Default for Settings {
@@ -23,6 +26,7 @@ impl Default for Settings {
             lan_mode: false,
             port: proxy::DEFAULT_PORT,
             worker_domain: String::new(),
+            secret: None,
         }
     }
 }
@@ -65,11 +69,18 @@ struct StatusSnapshot {
     /// телефоне или в эмуляторе означает само устройство, и подключение не
     /// работало (by-sonic/tglock#36).
     share_address: Option<String>,
+    /// Полная ссылка tg://proxy для этого экземпляра. Нужна, чтобы заново
+    /// подключить Telegram после перезапуска (by-sonic/tglock#37).
+    telegram_link: Option<String>,
+    /// Секрет записан на диск и переживёт перезапуск.
+    secret_persistent: bool,
+    /// Почему секрет не сохранился — после перезапуска ссылка изменится.
+    secret_write_error: Option<String>,
     logs: Vec<LogLine>,
 }
 
 struct AppState {
-    stats: Arc<proxy::Stats>,
+    stats: Mutex<Arc<proxy::Stats>>,
     settings: Mutex<Settings>,
     active_port: Mutex<u16>,
     /// Слушатель работающего прокси. Нужен, чтобы показать адрес для других
@@ -79,6 +90,7 @@ struct AppState {
     started_at: Mutex<Option<Instant>>,
     logs: Arc<Mutex<Vec<LogLine>>>,
     settings_path: PathBuf,
+    secret_path: PathBuf,
 }
 
 impl AppState {
@@ -87,15 +99,26 @@ impl AppState {
             .ok()
             .and_then(|contents| serde_json::from_slice(&contents).ok())
             .unwrap_or_default();
+        let secret_path = gui_secret_path(&settings_path);
+        migrate_legacy_secret(&secret_path);
         Self {
-            stats: proxy::Stats::new(),
+            stats: Mutex::new(build_stats(&settings, &secret_path)),
             settings: Mutex::new(settings),
             active_port: Mutex::new(proxy::DEFAULT_PORT),
             active_listen: Mutex::new(None),
             started_at: Mutex::new(None),
             logs: Arc::new(Mutex::new(Vec::new())),
             settings_path,
+            secret_path,
         }
+    }
+
+    fn stats(&self) -> Arc<proxy::Stats> {
+        self.stats.lock().unwrap().clone()
+    }
+
+    fn replace_stats(&self, settings: &Settings) {
+        *self.stats.lock().unwrap() = build_stats(settings, &self.secret_path);
     }
 
     fn log(&self, message: impl Into<String>, error: bool) {
@@ -111,30 +134,38 @@ impl AppState {
     }
 
     fn snapshot(&self) -> StatusSnapshot {
+        let stats = self.stats();
         // События прокси доходят до журнала только здесь: у ядра нет своего
         // способа что-то показать, а интерфейс и так опрашивает состояние.
-        for event in self.stats.drain_events() {
+        for event in stats.drain_events() {
             self.log(event, false);
         }
-        let data_center = self.stats.last_dc();
-        let route = transport::route_label(self.stats.last_route());
+        let data_center = stats.last_dc();
+        let route = transport::route_label(stats.last_route());
+        let active_listen = *self.active_listen.lock().unwrap();
+        let settings = self.settings.lock().unwrap().clone();
+        let listen = active_listen.unwrap_or_else(|| listen_from_settings(&settings));
+        let secret_write_error = stats.secret_write_error().map(str::to_owned);
         StatusSnapshot {
-            running: self.stats.running.load(Ordering::SeqCst),
-            active_connections: self.stats.active.load(Ordering::Relaxed),
-            tunnels: self.stats.ws.load(Ordering::Relaxed),
+            running: stats.running.load(Ordering::SeqCst),
+            active_connections: stats.active.load(Ordering::Relaxed),
+            tunnels: stats.ws.load(Ordering::Relaxed),
             data_center: (data_center > 0).then_some(data_center),
             route: route.to_owned(),
-            failures: self.stats.ws_failures.load(Ordering::Relaxed),
-            route_failures: self.stats.route_failures(),
-            blocked: self.stats.blocked.load(Ordering::Relaxed),
-            unknown_clients: self.stats.unknown_clients.load(Ordering::Relaxed),
+            failures: stats.ws_failures.load(Ordering::Relaxed),
+            route_failures: stats.route_failures(),
+            blocked: stats.blocked.load(Ordering::Relaxed),
+            unknown_clients: stats.unknown_clients.load(Ordering::Relaxed),
             uptime_seconds: self
                 .started_at
                 .lock()
                 .unwrap()
                 .map_or(0, |started| started.elapsed().as_secs()),
             port: *self.active_port.lock().unwrap(),
-            share_address: share_address(*self.active_listen.lock().unwrap()),
+            share_address: share_address(active_listen),
+            telegram_link: Some(telegram_link(listen, &stats)),
+            secret_persistent: settings.secret.is_some() || secret_write_error.is_none(),
+            secret_write_error,
             logs: self.logs.lock().unwrap().clone(),
         }
     }
@@ -149,6 +180,78 @@ impl AppState {
         std::fs::write(&self.settings_path, contents)
             .map_err(|error| format!("Не удалось сохранить настройки: {error}"))
     }
+}
+
+fn gui_secret_path(settings_path: &Path) -> PathBuf {
+    settings_path
+        .parent()
+        .map(|dir| dir.join("secret"))
+        .unwrap_or_else(|| PathBuf::from("secret"))
+}
+
+#[cfg(not(test))]
+fn legacy_secret_path() -> Option<PathBuf> {
+    mtproto::default_secret_path()
+}
+
+#[cfg(test)]
+fn legacy_secret_path() -> Option<PathBuf> {
+    None
+}
+
+fn migrate_legacy_secret(target: &Path) {
+    if target.exists() {
+        return;
+    }
+    let Some(legacy) = legacy_secret_path() else {
+        return;
+    };
+    if !legacy.exists() {
+        return;
+    }
+    let Ok(contents) = std::fs::read_to_string(&legacy) else {
+        return;
+    };
+    if mtproto::parse_secret(contents.trim()).is_none() {
+        return;
+    }
+    if let Some(parent) = target.parent().filter(|path| !path.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(&legacy, target);
+}
+
+fn normalize_settings_secret(settings: &mut Settings) -> Result<(), String> {
+    if let Some(secret) = settings.secret.as_ref() {
+        let trimmed = secret.trim();
+        if trimmed.is_empty() {
+            settings.secret = None;
+        } else {
+            let parsed = mtproto::parse_secret(trimmed)
+                .ok_or_else(|| "Секрет: 32 hex-символа или dd…".to_string())?;
+            settings.secret = Some(mtproto::telegram_secret(&parsed));
+        }
+    }
+    Ok(())
+}
+
+fn build_stats(settings: &Settings, secret_path: &Path) -> Arc<proxy::Stats> {
+    if let Some(secret) = settings.secret.as_deref().and_then(mtproto::parse_secret) {
+        return proxy::Stats::with_secret(secret);
+    }
+    proxy::Stats::with_stored_secret(mtproto::load_or_create_secret_at(secret_path))
+}
+
+fn listen_from_settings(settings: &Settings) -> ListenConfig {
+    if settings.lan_mode {
+        ListenConfig::lan(settings.port)
+    } else {
+        ListenConfig::loopback(settings.port)
+    }
+}
+
+fn telegram_link(listen: ListenConfig, stats: &proxy::Stats) -> String {
+    listen.telegram_link(&stats.telegram_secret())
 }
 
 /// Адрес, который нужно вписать в Telegram на другом устройстве.
@@ -188,26 +291,30 @@ fn get_settings(state: State<'_, AppState>) -> Settings {
 
 #[tauri::command]
 fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result<Settings, String> {
-    if state.stats.running.load(Ordering::SeqCst) {
+    if state.stats().running.load(Ordering::SeqCst) {
         return Err("Сначала выключите защиту".into());
     }
     if settings.port == 0 {
         return Err("Порт должен быть от 1 до 65535".into());
     }
+    let mut settings = settings;
+    normalize_settings_secret(&mut settings)?;
     state.persist_settings(&settings)?;
     *state.settings.lock().unwrap() = settings.clone();
+    state.replace_stats(&settings);
     state.log("Настройки сохранены", false);
     Ok(settings)
 }
 
 #[tauri::command]
 fn start_proxy(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
-    if state.stats.running.load(Ordering::SeqCst) {
+    if state.stats().running.load(Ordering::SeqCst) {
         return Ok(state.snapshot());
     }
 
     let settings = state.settings.lock().unwrap().clone();
-    state.stats.set_worker_domain(&settings.worker_domain);
+    let stats = state.stats();
+    stats.set_worker_domain(&settings.worker_domain);
     *state.active_port.lock().unwrap() = settings.port;
     *state.started_at.lock().unwrap() = Some(Instant::now());
     state.log("Запускаю защищённый маршрут…", false);
@@ -220,7 +327,6 @@ fn start_proxy(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
 
     *state.active_listen.lock().unwrap() = Some(listen);
 
-    let stats = state.stats.clone();
     let logs = state.logs.clone();
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Runtime::new() {
@@ -236,7 +342,7 @@ fn start_proxy(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
     });
 
     std::thread::sleep(std::time::Duration::from_millis(220));
-    if !state.stats.running.load(Ordering::SeqCst) {
+    if !state.stats().running.load(Ordering::SeqCst) {
         *state.active_listen.lock().unwrap() = None;
         *state.started_at.lock().unwrap() = None;
         return Err(state
@@ -249,14 +355,15 @@ fn start_proxy(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
     }
 
     state.log(format!("Прокси запущен на {}", listen.addr), false);
-    let _ = open::that(listen.telegram_link(&state.stats.telegram_secret()));
+    let stats = state.stats();
+    let _ = open::that(listen.telegram_link(&stats.telegram_secret()));
     state.log("Открываю подключение в Telegram…", false);
     Ok(state.snapshot())
 }
 
 #[tauri::command]
 fn stop_proxy(state: State<'_, AppState>) -> StatusSnapshot {
-    state.stats.stop();
+    state.stats().stop();
     *state.active_listen.lock().unwrap() = None;
     *state.started_at.lock().unwrap() = None;
     state.log("Защита выключена", false);
@@ -332,7 +439,7 @@ fn main() {
             // Если секрет не удалось записать, ссылка tg://proxy изменится после
             // перезапуска и Telegram откажется подключаться к сохранённой.
             // Раньше это происходило молча (by-sonic/tglock#37).
-            if let Some(error) = state.stats.secret_write_error() {
+            if let Some(error) = state.stats().secret_write_error() {
                 state.log(
                     format!("Секрет не сохранён ({error}). После перезапуска ссылка изменится"),
                     true,
@@ -424,5 +531,59 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn gui_secret_lives_next_to_settings() {
+        let settings = PathBuf::from("/tmp/tglock/settings.json");
+        assert_eq!(
+            gui_secret_path(&settings),
+            PathBuf::from("/tmp/tglock/secret")
+        );
+    }
+
+    #[test]
+    fn pinned_secret_is_normalized_to_telegram_form() {
+        let mut settings = Settings {
+            lan_mode: false,
+            port: 1080,
+            worker_domain: String::new(),
+            secret: Some("abababababababababababababababab".into()),
+        };
+        normalize_settings_secret(&mut settings).expect("valid hex secret");
+        assert_eq!(
+            settings.secret.as_deref(),
+            Some("ddabababababababababababababababab")
+        );
+    }
+
+    #[test]
+    fn file_backed_secret_survives_restarts() {
+        let dir = std::env::temp_dir().join(format!("tglock-secret-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let secret_path = dir.join("secret");
+        let settings = Settings::default();
+        let first = build_stats(&settings, &secret_path);
+        let second = build_stats(&settings, &secret_path);
+        assert_eq!(
+            first.telegram_secret(),
+            second.telegram_secret(),
+            "secret file must pin tg://proxy across restarts"
+        );
+        assert!(
+            first.secret_write_error().is_none(),
+            "fresh tempdir must allow writing the secret"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn telegram_link_uses_the_same_secret_as_stats() {
+        let stats = proxy::Stats::with_secret([0xab; 16]);
+        let listen = ListenConfig::loopback(1080);
+        assert_eq!(
+            telegram_link(listen, &stats),
+            listen.telegram_link(&stats.telegram_secret())
+        );
     }
 }

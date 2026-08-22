@@ -113,6 +113,11 @@ pub fn load_or_create_secret() -> StoredSecret {
 }
 
 #[cfg(not(test))]
+pub fn default_secret_path() -> Option<PathBuf> {
+    secret_path()
+}
+
+#[cfg(not(test))]
 fn secret_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
