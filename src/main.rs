@@ -56,6 +56,12 @@ struct StatusSnapshot {
     /// Клиенты, которые дошли, но не сумели договориться. Почти всегда это
     /// ссылка `tg://proxy` от прошлого запуска, то есть другой секрет.
     unknown_clients: u32,
+    /// Соединения, которые открылись и ничего не прислали до таймаута.
+    ///
+    /// Растущее число в такт с переподключениями клиента означает, что он
+    /// открывает соединения впрок, а мы закрываем их по таймауту
+    /// (by-sonic/tglock#42).
+    silent_clients: u32,
     uptime_seconds: u64,
     port: u16,
     /// Адрес, который нужно вписать в Telegram на другом устройстве.
@@ -128,6 +134,7 @@ impl AppState {
             route_failures: self.stats.route_failures(),
             blocked: self.stats.blocked.load(Ordering::Relaxed),
             unknown_clients: self.stats.unknown_clients.load(Ordering::Relaxed),
+            silent_clients: self.stats.silent_clients.load(Ordering::Relaxed),
             uptime_seconds: self
                 .started_at
                 .lock()

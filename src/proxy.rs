@@ -41,6 +41,15 @@ pub struct Stats {
     /// прошлого запуска. Такое соединение закрывалось молча, и по диагностике
     /// отличить его от рабочего было нельзя.
     pub unknown_clients: AtomicU32,
+    /// Сколько соединений открылось и ничего не прислало за `IO_TIMEOUT`.
+    ///
+    /// Такое соединение закрывается по таймауту и до сих пор не попадало ни в
+    /// один счётчик: `unknown_clients` растёт, только когда запрос пришёл и не
+    /// разобрался, а не когда его не дождались. По диагностике это выглядело
+    /// как соединение без туннеля и ничего больше — а репортёр #42 видел, что
+    /// его телефон переустанавливает соединение примерно раз в десять секунд,
+    /// то есть ровно с этим периодом.
+    pub silent_clients: AtomicU32,
     /// DC и маршрут последнего поднятого туннеля, упакованные в одно значение.
     ///
     /// Раньше это были два независимых поля: номер писало соединение при
@@ -113,6 +122,7 @@ impl Stats {
             ws_failures: AtomicU32::new(0),
             blocked: AtomicU32::new(0),
             unknown_clients: AtomicU32::new(0),
+            silent_clients: AtomicU32::new(0),
             last_tunnel: AtomicU32::new(0),
             transport: crate::transport::TransportEngine::new(),
             secret,
@@ -156,6 +166,25 @@ impl Stats {
             None => "неизвестный адрес".to_owned(),
         };
         self.note(format!("Клиент {who}: {reason}"));
+    }
+
+    /// Клиент открыл соединение и не сказал ничего.
+    ///
+    /// Отличается от `note_unknown_client` тем, что там запрос пришёл и не
+    /// разобрался, а здесь его не дождались. Для клиента, который открывает
+    /// соединения про запас, это норма; для клиента, который переоткрывает их
+    /// в такт с таймаутом, — нет, и разницу видно только по счётчику
+    /// (by-sonic/tglock#42).
+    fn note_silent_client(&self, peer: Option<SocketAddr>, reason: &str) {
+        self.silent_clients.fetch_add(1, Ordering::Relaxed);
+        let who = match peer {
+            Some(peer) => peer.ip().to_string(),
+            None => "неизвестный адрес".to_owned(),
+        };
+        self.note(format!(
+            "Клиент {who}: {reason} за {} с — соединение закрыто",
+            IO_TIMEOUT.as_secs()
+        ));
     }
 
     /// Отметить, что до прокси дотянулось устройство из сети, а не с этой машины.
@@ -349,9 +378,13 @@ async fn detect_protocol(
     stats: &Stats,
 ) -> Result<Protocol, Box<dyn std::error::Error + Send + Sync>> {
     let mut probe = [0; INIT_LEN];
-    let peeked = tokio::time::timeout(IO_TIMEOUT, stream.peek(&mut probe[..1]))
-        .await
-        .map_err(|_| "client protocol detection timeout")??;
+    let peeked = match tokio::time::timeout(IO_TIMEOUT, stream.peek(&mut probe[..1])).await {
+        Ok(peeked) => peeked?,
+        Err(_) => {
+            stats.note_silent_client(stream.peer_addr().ok(), "не прислал ни байта");
+            return Err("client protocol detection timeout".into());
+        }
+    };
     if peeked == 0 {
         return Ok(Protocol::Empty);
     }
@@ -522,9 +555,15 @@ async fn handle_mtproto(
     stream.set_nodelay(true)?;
     let peer = stream.peer_addr().ok();
     let mut init = [0; 64];
-    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut init))
-        .await
-        .map_err(|_| "MTProto init timeout")??;
+    match tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut init)).await {
+        Ok(result) => {
+            result?;
+        }
+        Err(_) => {
+            stats.note_silent_client(peer, "начал MTProto-init и не дослал его");
+            return Err("MTProto init timeout".into());
+        }
+    }
     let parsed = match crate::mtproto::parse_client_init(&init, &stats.secret) {
         Some(parsed) => parsed,
         None => {
@@ -1554,6 +1593,146 @@ mod tests {
                 .any(|event| event.contains("в списке маршрутов: spare.workers.dev")),
             "принятый домен нужно подтвердить, иначе проверить нечем: {events:?}"
         );
+    }
+
+    /// Ping от той стороны обязан получить Pong, и туннель обязан это пережить.
+    ///
+    /// Ping приходит в читающую половину, а отвечать на него должна пишущая.
+    /// Единственный маршрут, где Ping вообще бывает, — Cloudflare Worker:
+    /// у Telegram его нет. Поэтому поломка на этом пути видна только тем, у
+    /// кого настроен воркер (by-sonic/tglock#42).
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn a_ping_is_answered_and_the_tunnel_survives_it() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = relay_listener.local_addr().unwrap().port();
+        let (report_tx, report_rx) = tokio::sync::oneshot::channel::<Result<Vec<u8>, String>>();
+
+        tokio::spawn(async move {
+            let (tcp, _) = relay_listener.accept().await.unwrap();
+            let mut websocket =
+                tokio_tungstenite::accept_hdr_async(tcp, |_: &Request, mut response: Response| {
+                    response.headers_mut().insert(
+                        "Sec-WebSocket-Protocol",
+                        "binary".parse().expect("static header value"),
+                    );
+                    Ok(response)
+                })
+                .await
+                .unwrap();
+
+            let init = match websocket.next().await {
+                Some(Ok(Message::Binary(data))) => data,
+                other => {
+                    let _ = report_tx.send(Err(format!("ожидался init, пришло {other:?}")));
+                    return;
+                }
+            };
+            let header: [u8; INIT_LEN] = init.as_slice().try_into().unwrap();
+            let mut relay = crate::mtproto::test_relay_peer(&header);
+
+            websocket
+                .send(Message::Ping(b"keepalive".to_vec()))
+                .await
+                .unwrap();
+
+            let mut answered = false;
+            let mut payload = Vec::new();
+            while payload.is_empty() {
+                match websocket.next().await {
+                    Some(Ok(Message::Pong(pong))) => {
+                        answered = pong == b"keepalive";
+                    }
+                    Some(Ok(Message::Binary(mut data))) => {
+                        relay.decrypt(&mut data);
+                        payload.extend_from_slice(&data);
+                    }
+                    Some(Ok(_)) => {}
+                    other => {
+                        let _ = report_tx.send(Err(format!(
+                            "туннель закрылся до полезных данных: {other:?}"
+                        )));
+                        return;
+                    }
+                }
+            }
+            let _ = report_tx.send(if answered {
+                Ok(payload)
+            } else {
+                Err("Pong не пришёл".to_owned())
+            });
+        });
+
+        let stats = Stats::new();
+        stats.transport.force_local_route(relay_port);
+        let (port, server) = start_proxy(stats.clone(), false).await;
+
+        let init = unambiguous_client_init(&stats.secret, -4);
+        let mut peer = crate::mtproto::test_client_peer(&init, &stats.secret);
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(&init).await.unwrap();
+
+        // Клиент шлёт после Ping'а: если ответ на Ping ломает пишущую половину,
+        // это не дойдёт.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let request = b"a request sent after the ping".to_vec();
+        let mut wire = request.clone();
+        peer.encrypt(&mut wire);
+        client.write_all(&wire).await.unwrap();
+
+        let report = tokio::time::timeout(Duration::from_secs(5), report_rx)
+            .await
+            .expect("реле должно доложить о результате")
+            .unwrap();
+        assert_eq!(report, Ok(request), "Ping не должен ломать туннель");
+
+        stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    /// Клиент, открывший соединение и промолчавший, обязан быть посчитан.
+    ///
+    /// До этого он не попадал никуда: `не опознано` растёт только когда запрос
+    /// пришёл и не разобрался. Репортёр #42 видел, что телефон переоткрывает
+    /// соединение примерно раз в десять секунд — ровно период `IO_TIMEOUT`, —
+    /// и проверить это по диагностике было нечем.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_says_nothing_is_counted_and_named() {
+        let stats = Stats::new();
+        let (port, server) = start_proxy(stats.clone(), false).await;
+
+        // Соединение открыто и молчит. Время в тесте идёт само, как только
+        // рантайму больше нечего делать.
+        let _client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+
+        // Бюджет ожидания должен быть больше `IO_TIMEOUT`: время в тесте
+        // виртуальное и прыгает к ближайшему сроку, поэтому пятисекундный
+        // предел `wait_until` сработал бы первым.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while stats.silent_clients.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("молчащий клиент должен быть посчитан");
+        assert_eq!(
+            stats.unknown_clients.load(Ordering::Relaxed),
+            0,
+            "молчание — не то же самое, что неразобранный запрос"
+        );
+
+        let events = stats.drain_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("не прислал ни байта")),
+            "в журнале должно быть сказано, что клиент молчал: {events:?}"
+        );
+
+        stats.stop();
+        let _ = server.await.unwrap();
     }
 
     #[tokio::test]
