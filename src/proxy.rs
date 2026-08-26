@@ -217,7 +217,18 @@ impl Stats {
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        self.transport.set_worker_domains(&domains);
+        let result = self.transport.set_worker_domains(&domains);
+        // Молчание здесь неотличимо от «воркер работает»: пока строка не
+        // попадала в список маршрутов, об этом не сообщалось ничем, и человек
+        // считал резервный маршрут настроенным (by-sonic/tglock#50).
+        for rejected in &result.rejected {
+            self.note(format!(
+                "Cloudflare Worker «{rejected}» не похож на имя хоста — маршрут не добавлен.                  Нужно только имя, без https:// и без косой черты: example.workers.dev"
+            ));
+        }
+        for accepted in &result.accepted {
+            self.note(format!("Cloudflare Worker в списке маршрутов: {accepted}"));
+        }
     }
 
     pub fn stop(&self) {
@@ -665,7 +676,17 @@ async fn ws_tunnel(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::{SinkExt, StreamExt};
 
-    let (ws, connected) = stats.transport.connect(dc, media).await?;
+    let (ws, connected) = match stats.transport.connect(dc, media).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            // Единственное место, где известно, ПОЧЕМУ туннеля нет. Раньше
+            // текст уходил в `Err` и там пропадал: оставался счётчик сбоев без
+            // причины, и отличить «провайдер режет адреса» от «воркер отвечает
+            // отказом» было нечем (by-sonic/tglock#50).
+            stats.note(error.clone());
+            return Err(error.into());
+        }
+    };
     let _tunnel = EstablishedTunnel::new(stats);
     stats.note_tunnel(dc, connected.route.kind.ui_code());
 
@@ -1471,6 +1492,68 @@ mod tests {
 
         stats.stop();
         let _ = server.await.unwrap();
+    }
+
+    /// Диагностика обязана называть причину, а не только считать сбои.
+    ///
+    /// При `туннелей 0` счётчик сбоев говорит, что не получилось, и молчит о
+    /// том, почему. Текст ошибки собирался и выбрасывался, и разобрать
+    /// «провайдер режет адреса» против «воркер отвечает отказом» было нечем
+    /// (by-sonic/tglock#50).
+    #[tokio::test]
+    async fn a_cascade_that_failed_says_why_in_the_log() {
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+
+        let stats = Stats::new();
+        stats.transport.force_local_route(dead_port);
+        let (port, server) = start_proxy(stats.clone(), false).await;
+
+        let init = unambiguous_client_init(&stats.secret, 2);
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(&init).await.unwrap();
+
+        wait_until("сбой засчитан", || {
+            stats.ws_failures.load(Ordering::Relaxed) > 0
+        })
+        .await;
+
+        let events = stats.drain_events();
+        let named = events
+            .iter()
+            .find(|event| event.contains("Не поднялся туннель до DC2"))
+            .unwrap_or_else(|| panic!("причина отказа не попала в журнал: {events:?}"));
+        assert!(
+            named.contains("127.0.0.1"),
+            "в журнале должен быть назван адрес, до которого не дошли: {named}"
+        );
+
+        stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    /// Строка, не похожая на имя хоста, отбрасывалась молча, и «воркер
+    /// настроен» ничем не отличалось от «воркера нет» (by-sonic/tglock#50).
+    #[test]
+    fn a_worker_domain_is_confirmed_or_named_as_rejected() {
+        let stats = Stats::new();
+        stats.set_worker_domain("https://mine.workers.dev/, spare.workers.dev");
+        let events = stats.drain_events();
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("https://mine.workers.dev/")
+                    && event.contains("не похож на имя хоста")),
+            "отвергнутый домен должен быть назван вместе с причиной: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("в списке маршрутов: spare.workers.dev")),
+            "принятый домен нужно подтвердить, иначе проверить нечем: {events:?}"
+        );
     }
 
     #[tokio::test]

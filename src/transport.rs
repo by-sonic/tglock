@@ -87,6 +87,15 @@ impl Route {
     }
 }
 
+/// Что случилось с доменами Worker'а, которые задал пользователь.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkerDomains {
+    /// Домены, попавшие в список маршрутов.
+    pub accepted: Vec<String>,
+    /// Строки, не похожие на имя хоста, — маршрута из них не вышло.
+    pub rejected: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ConnectedRoute {
     pub route: Route,
@@ -151,15 +160,29 @@ impl TransportEngine {
         Self::default()
     }
 
-    pub fn set_worker_domains(&self, domains: &[String]) {
-        let mut normalized = Vec::new();
+    /// Задать домены Worker'ов, вернув принятые и отвергнутые по отдельности.
+    ///
+    /// Отвергнутые возвращаются, потому что раньше они отбрасывались молча:
+    /// вписанный со схемой или слэшем `https://name.workers.dev/` не проходил
+    /// проверку, маршрут не появлялся, и «воркер настроен» ничем не отличалось
+    /// от «воркера нет» (by-sonic/tglock#50).
+    pub fn set_worker_domains(&self, domains: &[String]) -> WorkerDomains {
+        let mut accepted = Vec::new();
+        let mut rejected = Vec::new();
         for domain in domains {
-            let domain = domain.trim().to_ascii_lowercase();
-            if valid_domain(&domain) && !normalized.contains(&domain) {
-                normalized.push(domain);
+            let trimmed = domain.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let normalized = trimmed.to_ascii_lowercase();
+            if !valid_domain(&normalized) {
+                rejected.push(trimmed.to_owned());
+            } else if !accepted.contains(&normalized) {
+                accepted.push(normalized);
             }
         }
-        *self.worker_domains.lock().unwrap() = normalized;
+        *self.worker_domains.lock().unwrap() = accepted.clone();
+        WorkerDomains { accepted, rejected }
     }
 
     pub async fn connect(
@@ -179,18 +202,22 @@ impl TransportEngine {
                 }
                 Err(error) => {
                     self.record_failure(&route);
-                    errors.push(format!(
-                        "{} via {}: {}",
-                        route.websocket_host, route.connect_host, error
-                    ));
+                    let attempt = format!("{} — {}", route.connect_host, error);
+                    if !errors.contains(&attempt) {
+                        errors.push(attempt);
+                    }
                 }
             }
         }
 
+        // Текст читает человек: он попадает в журнал событий, и по нему
+        // отличают «провайдер режет закреплённые адреса» от «воркер отвечает
+        // отказом». Раньше причина отказа не доходила никуда, и при
+        // `туннелей 0` узнать, почему их ноль, было нечем (by-sonic/tglock#50).
         Err(format!(
-            "all Telegram routes for DC{}{} failed: {}",
+            "Не поднялся туннель до DC{}{}: {}",
             dc,
-            if media { " media" } else { "" },
+            if media { " (медиа)" } else { "" },
             errors.join("; ")
         ))
     }
@@ -376,8 +403,8 @@ async fn connect_route(route: &Route) -> Result<TelegramWebSocket, String> {
         TcpStream::connect((route.connect_host.as_str(), route.port)),
     )
     .await
-    .map_err(|_| "TCP connect timeout".to_owned())?
-    .map_err(|error| format!("TCP connect: {}", error))?;
+    .map_err(|_| "не отвечает (таймаут TCP)".to_owned())?
+    .map_err(|error| format!("соединение не открылось: {}", error))?;
     tcp.set_nodelay(true)
         .map_err(|error| format!("TCP_NODELAY: {}", error))?;
 
@@ -402,9 +429,9 @@ async fn connect_route(route: &Route) -> Result<TelegramWebSocket, String> {
             tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(tcp)),
         )
         .await
-        .map_err(|_| "WebSocket timeout".to_owned())?
+        .map_err(|_| "таймаут WebSocket".to_owned())?
         .map(|(websocket, _)| websocket)
-        .map_err(|error| format!("WebSocket handshake: {}", error));
+        .map_err(|error| format!("рукопожатие WebSocket: {}", error));
     }
 
     // The URI host remains the real Telegram hostname even when the TCP socket
@@ -417,7 +444,7 @@ async fn connect_route(route: &Route) -> Result<TelegramWebSocket, String> {
         tokio_tungstenite::client_async_tls_with_config(request, tcp, None, Some(connector)),
     )
     .await
-    .map_err(|_| "TLS/WebSocket timeout".to_owned())?
+    .map_err(|_| "таймаут TLS/WebSocket".to_owned())?
     .map(|(websocket, _)| websocket)
     .map_err(|error| format!("TLS/WebSocket handshake: {}", error))
 }
@@ -612,7 +639,7 @@ mod tests {
     #[test]
     fn worker_domains_are_rejected_unless_they_are_plain_hostnames() {
         let engine = TransportEngine::new();
-        engine.set_worker_domains(&[
+        let result = engine.set_worker_domains(&[
             "https://scheme.workers.dev".to_owned(),
             "with.a/path".to_owned(),
             "no-dot".to_owned(),
@@ -633,6 +660,17 @@ mod tests {
             .filter(|route| route.kind == RouteKind::CloudflareWorker)
             .collect();
         assert_eq!(workers.len(), 1, "only the valid hostname may survive");
+        assert_eq!(result.accepted, vec!["good.workers.dev".to_owned()]);
+        assert!(
+            result.rejected.contains(&"https://scheme.workers.dev".to_owned()),
+            "отвергнутая строка обязана вернуться названной, иначе о ней некому              сообщить: {:?}",
+            result.rejected
+        );
+        assert!(
+            !result.rejected.iter().any(String::is_empty),
+            "пустая строка — не то, о чём стоит предупреждать: {:?}",
+            result.rejected
+        );
         assert_eq!(workers[0].websocket_host, "good.workers.dev");
     }
 
