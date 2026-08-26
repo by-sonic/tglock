@@ -65,3 +65,9 @@ rand = "0.8"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
+
+[dev-dependencies]
+# `start_paused` в тестах: таймаут ожидания запроса от клиента — десять секунд,
+# и ждать их по-настоящему в тесте нельзя. В сборку не попадает: dev-зависимости
+# участвуют только в тестах.
+tokio = { version = "1", features = ["test-util"] }

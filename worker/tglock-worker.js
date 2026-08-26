@@ -68,12 +68,25 @@ export default {
       }
     };
 
+    // Запись сериализуется: следующий чанк уходит только после того, как
+    // записан предыдущий, и только когда писатель к этому готов.
+    //
+    // Раньше `write()` вызывался поверх незавершённого, а `writer.ready` не
+    // спрашивался вовсе — backpressure не применялся. Пока в клиенте отправка
+    // голодала, поверх воркера настоящего потока вверх не бывало и это не
+    // проявлялось. Как только голодание починили, в воркер пошёл настоящий
+    // поток (by-sonic/tglock#42).
+    let pending = Promise.resolve();
+
     server.addEventListener("message", (event) => {
       const chunk =
         event.data instanceof ArrayBuffer
           ? new Uint8Array(event.data)
           : event.data;
-      writer.write(chunk).catch(shutdown);
+      pending = pending
+        .then(() => writer.ready)
+        .then(() => writer.write(chunk))
+        .catch(shutdown);
     });
     server.addEventListener("close", shutdown);
     server.addEventListener("error", shutdown);

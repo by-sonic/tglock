@@ -15,6 +15,8 @@ type Status = {
   blocked: number;
   /// Клиенты, которые дошли, но не сумели договориться о рукопожатии.
   unknownClients: number;
+  /// Соединения, которые открылись и ничего не прислали до таймаута.
+  silentClients: number;
   uptimeSeconds: number;
   port: number;
   /// Адрес для других устройств. Приходит только в LAN-режиме.
@@ -47,6 +49,7 @@ let status: Status = {
   routeFailures: 0,
   blocked: 0,
   unknownClients: 0,
+  silentClients: 0,
   uptimeSeconds: 0,
   port: 1080,
   shareAddress: null,
@@ -296,6 +299,10 @@ function renderDiagnostics(): void {
         <article class="metric-card">
           <span>Не опознаны</span>
           <strong>${status.unknownClients}</strong>
+        </article>
+        <article class="metric-card">
+          <span>Промолчали</span>
+          <strong>${status.silentClients}</strong>
         </article>
       </div>
 
