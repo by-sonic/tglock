@@ -16,6 +16,8 @@ const SOCKS5_VERSION: u8 = 0x05;
 /// byte as the start of a SOCKS5 greeting.
 const PROTOCOL_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const PROTOCOL_PROBE_INTERVAL: Duration = Duration::from_millis(5);
+/// Сколько неотвеченных Ping'ов держать, пока отправляющая половина занята.
+const PONG_QUEUE: usize = 4;
 
 pub struct Stats {
     pub running: AtomicBool,
@@ -658,55 +660,92 @@ async fn ws_tunnel(
     dc: u16,
     media: bool,
     init: &[u8; 64],
-    mut crypto: Option<crate::mtproto::CryptoContext>,
+    crypto: Option<crate::mtproto::CryptoContext>,
     stats: &Stats,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::{SinkExt, StreamExt};
 
-    let (mut ws, connected) = stats.transport.connect(dc, media).await?;
+    let (ws, connected) = stats.transport.connect(dc, media).await?;
     let _tunnel = EstablishedTunnel::new(stats);
     stats.note_tunnel(dc, connected.route.kind.ui_code());
 
     let (mut tcp_r, mut tcp_w) = tokio::io::split(tcp);
+    let (mut ws_w, mut ws_r) = ws.split();
+    let (upstream_crypto, downstream_crypto) = match crypto.map(|crypto| crypto.split()) {
+        Some((upstream, downstream)) => (Some(upstream), Some(downstream)),
+        None => (None, None),
+    };
 
     // Send buffered init as first frame
-    ws.send(tungstenite::Message::Binary(init.to_vec())).await?;
+    ws_w.send(tungstenite::Message::Binary(init.to_vec()))
+        .await?;
 
-    let mut buf = vec![0u8; 65536];
+    // Ping приходит в половину, которая читает, а отвечать на него должна та,
+    // которая пишет: владелец у отправляющей половины строго один.
+    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(PONG_QUEUE);
 
-    loop {
-        tokio::select! {
-            biased;
-
-            msg = ws.next() => match msg {
-                Some(Ok(tungstenite::Message::Binary(mut data))) => {
+    // Направления работают независимо друг от друга. Раньше это был один
+    // `select!`, и любое ожидание внутри него останавливало вторую половину:
+    // непрерывная загрузка не давала опросить клиента вообще, а клиент,
+    // который не успевал разбирать входящий поток, замораживал заодно и свою
+    // отправку. Telegram при этом ждёт от клиента подтверждений — без них
+    // сессия встаёт при живом туннеле (by-sonic/tglock#42, #32).
+    let downstream = async {
+        let mut crypto = downstream_crypto;
+        while let Some(message) = ws_r.next().await {
+            match message {
+                Ok(tungstenite::Message::Binary(mut data)) => {
                     if let Some(crypto) = &mut crypto {
-                        crypto.telegram_to_client(data.as_mut());
+                        crypto.apply(data.as_mut());
                     }
                     tcp_w.write_all(data.as_ref()).await?;
                     tcp_w.flush().await?;
                 }
-                Some(Ok(tungstenite::Message::Ping(p))) => {
-                    let _ = ws.send(tungstenite::Message::Pong(p)).await;
-                }
-                Some(Ok(tungstenite::Message::Close(_))) | None => break,
-                Some(Err(_)) => break,
-                _ => {}
-            },
-
-            n = tcp_r.read(&mut buf) => match n {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if let Some(crypto) = &mut crypto {
-                        crypto.client_to_telegram(&mut buf[..n]);
+                Ok(tungstenite::Message::Ping(payload)) => {
+                    if pong_tx.send(payload).await.is_err() {
+                        break;
                     }
-                    ws.send(tungstenite::Message::Binary(buf[..n].to_vec())).await?;
                 }
-            },
+                Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                Ok(_) => {}
+            }
         }
-    }
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    };
 
-    let _ = ws.close(None).await;
+    let upstream = async {
+        let mut crypto = upstream_crypto;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            tokio::select! {
+                read = tcp_r.read(&mut buf) => match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        if let Some(crypto) = &mut crypto {
+                            crypto.apply(&mut buf[..read]);
+                        }
+                        ws_w
+                            .send(tungstenite::Message::Binary(buf[..read].to_vec()))
+                            .await?;
+                    }
+                },
+                payload = pong_rx.recv() => match payload {
+                    Some(payload) => {
+                        ws_w.send(tungstenite::Message::Pong(payload)).await?;
+                    }
+                    None => break,
+                },
+            }
+        }
+        let _ = ws_w.close().await;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    };
+
+    tokio::pin!(downstream, upstream);
+    tokio::select! {
+        result = &mut downstream => result?,
+        result = &mut upstream => result?,
+    }
     Ok(())
 }
 
@@ -1465,5 +1504,183 @@ mod tests {
 
         stats.stop();
         server.await.unwrap().unwrap();
+    }
+
+    /// Скачивание не должно затыкать отправку.
+    ///
+    /// В `ws_tunnel` цикл `select!` помечен `biased`, то есть сначала всегда
+    /// опрашивается ветка чтения из WebSocket. Пока Telegram присылает данные
+    /// непрерывно — а именно так выглядит загрузка медиа или первичная
+    /// синхронизация телефона — ветка чтения из клиента не опрашивается
+    /// вообще, и исходящие пакеты клиента наверх не уходят.
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn a_download_in_flight_must_not_stop_the_client_from_sending() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = relay_listener.local_addr().unwrap().port();
+        let uploads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let relay_uploads = uploads.clone();
+
+        tokio::spawn(async move {
+            let (tcp, _) = relay_listener.accept().await.unwrap();
+            let websocket =
+                tokio_tungstenite::accept_hdr_async(tcp, |_: &Request, mut response: Response| {
+                    response.headers_mut().insert(
+                        "Sec-WebSocket-Protocol",
+                        "binary".parse().expect("static header value"),
+                    );
+                    Ok(response)
+                })
+                .await
+                .unwrap();
+            let (mut sink, mut stream) = websocket.split();
+
+            match stream.next().await {
+                Some(Ok(Message::Binary(_))) => {}
+                other => panic!("expected an init frame, got {other:?}"),
+            }
+
+            tokio::spawn(async move {
+                while let Some(message) = stream.next().await {
+                    if let Ok(Message::Binary(data)) = message {
+                        relay_uploads.fetch_add(data.len(), Ordering::Relaxed);
+                    }
+                }
+            });
+
+            // Непрерывный поток вниз — так выглядит загрузка медиа.
+            while sink.send(Message::Binary(vec![0; 32 * 1024])).await.is_ok() {}
+        });
+
+        let stats = Stats::new();
+        stats.transport.force_local_route(relay_port);
+        let (port, server) = start_proxy(stats.clone(), false).await;
+
+        let init = unambiguous_client_init(&stats.secret, -4);
+        let client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (mut client_r, mut client_w) = client.into_split();
+        client_w.write_all(&init).await.unwrap();
+
+        // Клиент исправно читает загрузку, иначе он затыкал бы туннель сам.
+        let downloaded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = downloaded.clone();
+        tokio::spawn(async move {
+            let mut drain = vec![0; 64 * 1024];
+            while let Ok(read) = client_r.read(&mut drain).await {
+                if read == 0 {
+                    break;
+                }
+                counted.fetch_add(read, Ordering::Relaxed);
+            }
+        });
+
+        wait_until("загрузка пошла", || {
+            downloaded.load(Ordering::Relaxed) > 1024 * 1024
+        })
+        .await;
+
+        // Telegram ждёт от клиента подтверждений и запросов. Без них сессия
+        // встаёт: «Подключено», а сообщения висят с часиками.
+        tokio::spawn(async move {
+            while client_w.write_all(&[0x42; 128]).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while uploads.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("пока идёт загрузка, клиент должен доставить наверх хоть один байт");
+
+        stats.stop();
+        let _ = server.await.unwrap();
+    }
+
+    /// Медленный клиент не должен останавливать весь туннель.
+    ///
+    /// `ws_tunnel` читает и пишет в одной задаче: пока `tcp_w.write_all` ждёт,
+    /// когда клиент разберёт присланное, ветка чтения из клиента не
+    /// опрашивается, и наверх не уходит ничего. Телефон по Wi-Fi разбирает
+    /// поток медленнее, чем десктоп на той же машине по loopback — отсюда
+    /// асимметрия «на компьютере работает, на телефоне нет».
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn a_slow_client_must_not_freeze_its_own_uploads() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = relay_listener.local_addr().unwrap().port();
+        let uploads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let relay_uploads = uploads.clone();
+
+        tokio::spawn(async move {
+            let (tcp, _) = relay_listener.accept().await.unwrap();
+            let websocket =
+                tokio_tungstenite::accept_hdr_async(tcp, |_: &Request, mut response: Response| {
+                    response.headers_mut().insert(
+                        "Sec-WebSocket-Protocol",
+                        "binary".parse().expect("static header value"),
+                    );
+                    Ok(response)
+                })
+                .await
+                .unwrap();
+            let (mut sink, mut stream) = websocket.split();
+
+            match stream.next().await {
+                Some(Ok(Message::Binary(_))) => {}
+                other => panic!("expected an init frame, got {other:?}"),
+            }
+
+            tokio::spawn(async move {
+                while let Some(message) = stream.next().await {
+                    if let Ok(Message::Binary(data)) = message {
+                        relay_uploads.fetch_add(data.len(), Ordering::Relaxed);
+                    }
+                }
+            });
+
+            while sink.send(Message::Binary(vec![0; 32 * 1024])).await.is_ok() {}
+        });
+
+        let stats = Stats::new();
+        stats.transport.force_local_route(relay_port);
+        let (port, server) = start_proxy(stats.clone(), false).await;
+
+        let init = unambiguous_client_init(&stats.secret, -4);
+        let client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (client_r, mut client_w) = client.into_split();
+        client_w.write_all(&init).await.unwrap();
+
+        // Клиент занят и не разбирает входящий поток: его приёмное окно
+        // закрывается, и запись в него встаёт.
+        wait_until("туннель поднялся", || {
+            stats.last_route() != 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        tokio::spawn(async move {
+            while client_w.write_all(&[0x42; 128]).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            while uploads.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        drop(client_r);
+        stats.stop();
+        let _ = server.await.unwrap();
+        result.expect("клиент, который не успевает читать, всё равно должен отправлять");
     }
 }

@@ -43,6 +43,49 @@ impl CryptoContext {
         self.telegram_decrypt.apply_keystream(data);
         self.client_encrypt.apply_keystream(data);
     }
+
+    /// Разделить шифры по направлениям, чтобы туннель шёл в обе стороны сразу.
+    ///
+    /// Направления независимы: это два потока AES-CTR со своими ключами, и ни
+    /// один байт одного не влияет на другой.
+    pub fn split(self) -> (Upstream, Downstream) {
+        (
+            Upstream {
+                client_decrypt: self.client_decrypt,
+                telegram_encrypt: self.telegram_encrypt,
+            },
+            Downstream {
+                telegram_decrypt: self.telegram_decrypt,
+                client_encrypt: self.client_encrypt,
+            },
+        )
+    }
+}
+
+/// Шифры направления «клиент -> Telegram».
+pub struct Upstream {
+    client_decrypt: AesCtr,
+    telegram_encrypt: AesCtr,
+}
+
+impl Upstream {
+    pub fn apply(&mut self, data: &mut [u8]) {
+        self.client_decrypt.apply_keystream(data);
+        self.telegram_encrypt.apply_keystream(data);
+    }
+}
+
+/// Шифры направления «Telegram -> клиент».
+pub struct Downstream {
+    telegram_decrypt: AesCtr,
+    client_encrypt: AesCtr,
+}
+
+impl Downstream {
+    pub fn apply(&mut self, data: &mut [u8]) {
+        self.telegram_decrypt.apply_keystream(data);
+        self.client_encrypt.apply_keystream(data);
+    }
 }
 
 pub fn generate_secret() -> [u8; 16] {
