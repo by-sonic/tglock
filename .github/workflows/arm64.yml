@@ -1,0 +1,59 @@
+name: Static ARM64 CLI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  static-cli:
+    name: ARM64 musl build and runtime checks
+    runs-on: ubuntu-24.04-arm
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools binutils
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - name: Test the static headless target
+        run: cargo test --locked --target aarch64-unknown-linux-musl --no-default-features --features cli --lib --bins
+      - name: Build static CLI
+        run: cargo build --locked --release --target aarch64-unknown-linux-musl --no-default-features --features cli --bin tglock-cli
+      - name: Verify architecture and static linkage
+        run: |
+          binary=target/aarch64-unknown-linux-musl/release/tglock-cli
+          readelf -h "$binary" | grep -q 'Machine:.*AArch64'
+          if readelf -l "$binary" | grep -q INTERP; then
+            echo 'A static router binary must not have a dynamic interpreter'; exit 1
+          fi
+          if readelf -d "$binary" | grep -q NEEDED; then
+            echo 'A static router binary must not require shared libraries'; exit 1
+          fi
+          cp "$binary" tglock-cli-aarch64-unknown-linux-musl
+          sha256sum tglock-cli-aarch64-unknown-linux-musl > tglock-cli-aarch64-unknown-linux-musl.sha256
+      - name: Start, persist the secret, stop and restart
+        run: |
+          binary=./tglock-cli-aarch64-unknown-linux-musl
+          "$binary" --version
+          timeout --preserve-status --signal=TERM 5 "$binary" --port 18080 --secret-file "$RUNNER_TEMP/tglock-secret" > first.log 2>&1
+          grep -q '127.0.0.1:18080' first.log
+          grep -q 'tg://proxy' first.log
+          test "$(stat -c '%a' "$RUNNER_TEMP/tglock-secret")" = 600
+          timeout --preserve-status --signal=TERM 5 "$binary" --port 18080 --secret-file "$RUNNER_TEMP/tglock-secret" > second.log 2>&1
+          test "$(grep -o 'secret=[0-9a-f]*' first.log)" = "$(grep -o 'secret=[0-9a-f]*' second.log)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tglock-cli-aarch64-unknown-linux-musl
+          path: |
+            tglock-cli-aarch64-unknown-linux-musl
+            tglock-cli-aarch64-unknown-linux-musl.sha256
+          if-no-files-found: error

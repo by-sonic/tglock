@@ -9,6 +9,27 @@ permissions:
   contents: read
 
 jobs:
+  windows-core:
+    name: Windows headless core
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Lint CLI and core
+        run: cargo clippy --locked --no-default-features --features cli --all-targets -- -D warnings
+      - name: Test CLI and core
+        run: cargo test --locked --no-default-features --features cli --lib --bins
+      - name: Build CLI for manual Windows verification
+        run: cargo build --locked --no-default-features --features cli --bin tglock-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tglock-cli-windows-debug
+          path: target/debug/tglock-cli.exe
+          if-no-files-found: error
+          retention-days: 14
+
   rust:
     name: Rust checks
     runs-on: macos-latest
@@ -210,3 +231,9 @@ jobs:
 
       - name: Type-check and build
         run: npm ci && npm run build
+
+      - name: Worker contract and failure-path tests
+        run: npm run test:worker
+
+      - name: Offline protocol probe parser checks
+        run: node scripts/probe_proxy.mjs --self-test

@@ -1,9 +1,10 @@
 {
   "name": "tglock-ui",
   "private": true,
-  "version": "2.0.0-beta.14",
+  "version": "2.0.0-beta.15",
   "type": "module",
   "scripts": {
+    "test:worker": "node --experimental-vm-modules --test worker/tglock-worker.test.js",
     "dev": "vite --port 1420",
     "build": "tsc && vite build",
     "preview": "vite preview",

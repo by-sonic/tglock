@@ -1,6 +1,6 @@
 [package]
 name = "tglock"
-version = "2.0.0-beta.14"
+version = "2.0.0-beta.15"
 edition = "2021"
 rust-version = "1.88"
 description = "Telegram unblock via local WebSocket tunnel"
@@ -12,7 +12,7 @@ default = ["gui"]
 # The desktop GUI. Turning it off drops Tauri, the system WebView and the
 # frontend bundle from the build, which is what makes headless servers and
 # machines without a GPU or monitor able to build and run TGLock at all.
-gui = ["dep:tauri", "dep:tauri-build", "dep:open"]
+gui = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-opener"]
 # The headless binary. Deliberately NOT in `default`.
 #
 # When both binaries exist in one build, the Tauri bundler picks the wrong one
@@ -23,8 +23,9 @@ gui = ["dep:tauri", "dep:tauri-build", "dep:open"]
 cli = ["dep:clap", "dep:toml"]
 
 [lib]
-name = "tglock"
+name = "tglock_lib"
 path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
 name = "tglock"
@@ -38,7 +39,7 @@ required-features = ["cli"]
 
 [dependencies]
 tauri = { version = "2", features = [], optional = true }
-open = { version = "5", optional = true }
+tauri-plugin-opener = { version = "2", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 # Файл конфигурации CLI. TOML, а не JSON, потому что файл правят руками и в нём
 # нужны комментарии.
@@ -54,8 +55,10 @@ tokio = { version = "1", features = [
   "sync",
   "signal",
 ] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-native-tls = "0.2"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Explicit ring provider supports Android and static musl without OpenSSL.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
 futures-util = "0.3"
 aes = "0.8"
 ctr = "0.9"
@@ -67,6 +70,8 @@ rand = "0.8"
 tauri-build = { version = "2", features = [], optional = true }
 
 [dev-dependencies]
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # `start_paused` в тестах: таймаут ожидания запроса от клиента — десять секунд,
 # и ждать их по-настоящему в тесте нельзя. В сборку не попадает: dev-зависимости
 # участвуют только в тестах.

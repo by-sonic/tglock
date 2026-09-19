@@ -111,7 +111,8 @@ jobs:
             - **Сервер, контейнер, машина без монитора** — `tglock-cli-*`: то же самое, но без графического интерфейса
 
             Если Windows ругается на файл — [почему так и что с этим делать](https://github.com/by-sonic/tglock#-антивирус-ругается-smartscreen-предупреждает-virustotal-показывает-детекты).
-          releaseDraft: false
+          # Publish only after every platform, CLI and exact-commit APK is verified.
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
 
@@ -143,6 +144,27 @@ jobs:
           exe="$root/usr/bin/tglock"
           test -f "$exe" || { echo "нет /usr/bin/tglock:"; dpkg-deb -c "$deb" | grep '/bin/'; exit 1; }
           python3 scripts/verify_bundle_binary.py "$exe"
+
+  arm64-build:
+    needs: guard
+    uses: ./.github/workflows/arm64.yml
+    permissions:
+      contents: read
+
+  arm64-publish:
+    name: Attach verified ARM64 musl CLI
+    needs: [publish, arm64-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tglock-cli-aarch64-unknown-linux-musl
+          path: arm64-cli
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: arm64-cli/*
 
   cli:
     name: Headless CLI ${{ matrix.platform }}
@@ -209,5 +231,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
+          draft: true
           prerelease: false
           files: ${{ matrix.asset }}

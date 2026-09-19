@@ -12,8 +12,8 @@ use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tglock::cli_settings as config;
-use tglock::{proxy, transport};
+use tglock_lib::cli_settings as config;
+use tglock_lib::{proxy, transport};
 
 const STATUS_POLL: Duration = Duration::from_secs(1);
 
