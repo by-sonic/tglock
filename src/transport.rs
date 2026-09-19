@@ -1,13 +1,17 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const FALLBACK_DELAY: Duration = Duration::from_millis(250);
+const MAX_CONNECTING: usize = 3;
 const FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(30);
 const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
 const HTTPS_PORT: u16 = 443;
@@ -191,35 +195,95 @@ impl TransportEngine {
         media: bool,
     ) -> Result<(TelegramWebSocket, ConnectedRoute), String> {
         let key = DcKey { dc, media };
-        let candidates = self.ordered_candidates(key);
+        self.race_connections(key, |route| async move { connect_route(&route).await })
+            .await
+    }
+
+    // A slow first IP must not hold every other route hostage. At most three
+    // handshakes run per client, staggered so a healthy preferred route wins
+    // without opening needless fallback sockets. Dropping this future or
+    // returning a winner cancels every losing connection attempt.
+    async fn race_connections<T, F, Fut>(
+        &self,
+        key: DcKey,
+        mut connect: F,
+    ) -> Result<(T, ConnectedRoute), String>
+    where
+        F: FnMut(Route) -> Fut,
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
+        let mut candidates = self.ordered_candidates(key).into_iter().peekable();
+        let mut pending = FuturesUnordered::new();
+        let mut next_start = Instant::now();
         let mut errors = Vec::new();
 
-        for route in candidates {
-            match connect_route(&route).await {
-                Ok(websocket) => {
-                    self.record_success(key, &route);
-                    return Ok((websocket, ConnectedRoute { route }));
+        while candidates.peek().is_some() || !pending.is_empty() {
+            if candidates.peek().is_some()
+                && pending.len() < MAX_CONNECTING
+                && (pending.is_empty() || Instant::now() >= next_start)
+            {
+                let route = candidates.next().unwrap();
+                // Another client may have failed this route since we took our
+                // snapshot. Never knowingly bypass its current cooldown.
+                if !self.route_available(&route) {
+                    continue;
                 }
-                Err(error) => {
-                    self.record_failure(&route);
-                    let attempt = format!("{} — {}", route.connect_host, error);
-                    if !errors.contains(&attempt) {
-                        errors.push(attempt);
+                let connection = connect(route.clone());
+                pending.push(async move { (route, connection.await) });
+                next_start = Instant::now() + FALLBACK_DELAY;
+                continue;
+            }
+            tokio::select! {
+                Some((route, result)) = pending.next(), if !pending.is_empty() => {
+                    match result {
+                        Ok(connection) => {
+                            self.record_success(key, &route);
+                            return Ok((connection, ConnectedRoute { route }));
+                        }
+                        Err(error) => {
+                            self.record_failure(&route);
+                            errors.push(format!("{} (TLS {}) — {}", route.connect_host, route.websocket_host, error));
+                        }
                     }
                 }
+                _ = tokio::time::sleep_until(next_start),
+                    if candidates.peek().is_some() && pending.len() < MAX_CONNECTING => {}
             }
         }
 
-        // Текст читает человек: он попадает в журнал событий, и по нему
-        // отличают «провайдер режет закреплённые адреса» от «воркер отвечает
-        // отказом». Раньше причина отказа не доходила никуда, и при
-        // `туннелей 0` узнать, почему их ноль, было нечем (by-sonic/tglock#50).
+        if errors.is_empty() {
+            let routes = self.routes_for_key(key);
+            let health = self.health.lock().unwrap();
+            let retry = routes
+                .iter()
+                .filter_map(|route| health.routes.get(route))
+                .map(|entry| entry.retry_at.saturating_duration_since(Instant::now()))
+                .min();
+            errors.push(match retry {
+                Some(delay) => format!(
+                    "маршруты на паузе после ошибок; повтор через {} с",
+                    delay
+                        .as_secs()
+                        .saturating_add(u64::from(delay.subsec_nanos() != 0))
+                ),
+                None => "для этого дата-центра нет маршрутов".to_owned(),
+            });
+        }
         Err(format!(
             "Не поднялся туннель до DC{}{}: {}",
-            dc,
-            if media { " (медиа)" } else { "" },
+            key.dc,
+            if key.media { " (медиа)" } else { "" },
             errors.join("; ")
         ))
+    }
+
+    fn route_available(&self, route: &Route) -> bool {
+        self.health
+            .lock()
+            .unwrap()
+            .routes
+            .get(route)
+            .is_none_or(|health| health.retry_at <= Instant::now())
     }
 
     fn ordered_candidates(&self, key: DcKey) -> Vec<Route> {
@@ -241,25 +305,17 @@ impl TransportEngine {
         candidates.sort_by_key(|route| {
             let preferred_rank = u8::from(preferred != Some(route));
             let kind_rank = match route.kind {
-                RouteKind::TelegramIp => 0,
-                RouteKind::AlternateTelegramIp => 1,
-                RouteKind::SystemDns => 2,
-                RouteKind::CloudflareWorker => 3,
+                RouteKind::TelegramIp if Some(route) == all_routes.first() => 0,
+                // The operator explicitly configured this independent path.
+                // Start it after the primary IP, before more potentially
+                // blocked Telegram addresses consume the concurrency budget.
+                RouteKind::CloudflareWorker => 1,
+                RouteKind::TelegramIp | RouteKind::AlternateTelegramIp => 2,
+                RouteKind::SystemDns => 3,
             };
             (preferred_rank, kind_rank)
         });
 
-        // If every route is cooling down, retry the one that becomes available first.
-        if candidates.is_empty() {
-            if let Some((route, _)) = health
-                .routes
-                .iter()
-                .filter(|(route, _)| all_routes.contains(route))
-                .min_by_key(|(_, route_health)| route_health.retry_at)
-            {
-                candidates.push(route.clone());
-            }
-        }
         candidates
     }
 
@@ -299,9 +355,17 @@ impl TransportEngine {
         self.route_failures.load(Ordering::Relaxed)
     }
 
+    /// A successful WebSocket upgrade is not proof that its upstream works.
+    /// Call this for upstream failures after the handshake, never merely for
+    /// a client disconnect or a canceled losing connection attempt.
+    pub fn report_route_failure(&self, connected: &ConnectedRoute) {
+        self.record_failure(&connected.route);
+    }
+
     fn record_failure(&self, route: &Route) {
         self.route_failures.fetch_add(1, Ordering::Relaxed);
         let mut health = self.health.lock().unwrap();
+        health.preferred.retain(|_, preferred| preferred != route);
         let failures = health
             .routes
             .get(route)
@@ -363,6 +427,9 @@ fn telegram_ips(dc: u16) -> &'static [&'static str] {
 }
 
 pub fn routes_for_dc(dc: u16, media: bool) -> Vec<Route> {
+    if telegram_ips(dc).is_empty() {
+        return Vec::new();
+    }
     let websocket_dc = canonical_dc(dc);
     let primary = format!("kws{}.web.telegram.org", websocket_dc);
     let secondary = format!("kws{}-1.web.telegram.org", websocket_dc);
@@ -387,17 +454,52 @@ pub fn routes_for_dc(dc: u16, media: bool) -> Vec<Route> {
                 },
             ));
         }
-        routes.push(Route::https(
-            websocket_host.clone(),
-            websocket_host.clone(),
-            "/apiws".to_owned(),
-            RouteKind::SystemDns,
-        ));
+        // DC203 uses the DC2 hostname only for TLS/HTTP virtual hosting.
+        // Resolving it would connect to DC2 itself and send CDN sessions to
+        // the wrong data centre. Its fallback must retain the CDN address.
+        if dc != 203 {
+            routes.push(Route::https(
+                websocket_host.clone(),
+                websocket_host.clone(),
+                "/apiws".to_owned(),
+                RouteKind::SystemDns,
+            ));
+        }
     }
     routes
 }
 
 async fn connect_route(route: &Route) -> Result<TelegramWebSocket, String> {
+    connect_route_with_config(route, tls_config()).await
+}
+
+fn client_config(roots: rustls::RootCertStore) -> Arc<rustls::ClientConfig> {
+    Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    )
+}
+
+fn tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            client_config(rustls::RootCertStore::from_iter(
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+            ))
+        })
+        .clone()
+}
+
+async fn connect_route_with_config(
+    route: &Route,
+    config: Arc<rustls::ClientConfig>,
+) -> Result<TelegramWebSocket, String> {
     let tcp = tokio::time::timeout(
         CONNECT_TIMEOUT,
         TcpStream::connect((route.connect_host.as_str(), route.port)),
@@ -435,10 +537,10 @@ async fn connect_route(route: &Route) -> Result<TelegramWebSocket, String> {
     }
 
     // The URI host remains the real Telegram hostname even when the TCP socket
-    // is opened to a pinned IP. Native TLS therefore validates Telegram's
-    // certificate and sends the correct SNI.
-    let tls = native_tls::TlsConnector::new().map_err(|error| format!("TLS setup: {}", error))?;
-    let connector = tokio_tungstenite::Connector::NativeTls(tls);
+    // is opened to a pinned IP. rustls validates that hostname and certificate
+    // against the bundled roots, and sends that hostname in SNI. The explicit
+    // ring provider avoids process-global provider selection and its panics.
+    let connector = tokio_tungstenite::Connector::Rustls(config);
     tokio::time::timeout(
         CONNECT_TIMEOUT,
         tokio_tungstenite::client_async_tls_with_config(request, tcp, None, Some(connector)),
@@ -480,6 +582,22 @@ mod tests {
         let routes = routes_for_dc(203, false);
         assert_eq!(routes[0].websocket_host, "kws2.web.telegram.org");
         assert_eq!(routes[0].connect_host, "91.105.192.100");
+        assert!(routes
+            .iter()
+            .all(|route| route.connect_host == "91.105.192.100"));
+        assert!(!routes
+            .iter()
+            .any(|route| route.kind == RouteKind::SystemDns));
+        let engine = TransportEngine::new();
+        engine.set_worker_domains(&["cdn.workers.dev".to_owned()]);
+        let routes = engine.routes_for_key(DcKey {
+            dc: 203,
+            media: true,
+        });
+        assert!(routes
+            .iter()
+            .filter(|route| route.kind == RouteKind::CloudflareWorker)
+            .all(|route| route.path == "/apiws?dst=91.105.192.100&dc=203"));
     }
 
     #[test]
@@ -547,7 +665,7 @@ mod tests {
 
     #[test]
     fn every_data_center_offers_a_pinned_ip_and_a_dns_route() {
-        for dc in [1, 2, 3, 4, 5, 203] {
+        for dc in [1, 2, 3, 4, 5] {
             let routes = routes_for_dc(dc, false);
             assert!(
                 routes
@@ -611,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn all_routes_cooling_down_still_yields_the_soonest_retry() {
+    fn all_routes_cooling_down_do_not_bypass_the_backoff() {
         let engine = TransportEngine::new();
         let key = DcKey {
             dc: 5,
@@ -627,13 +745,7 @@ mod tests {
             engine.record_failure(route);
         }
 
-        let candidates = engine.ordered_candidates(key);
-        assert_eq!(
-            candidates.len(),
-            1,
-            "a fully cooling table must offer exactly one retry, not give up"
-        );
-        assert_eq!(candidates[0], routes[0]);
+        assert!(engine.ordered_candidates(key).is_empty());
     }
 
     #[test]
@@ -694,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_is_the_last_resort() {
+    fn explicit_worker_is_tried_before_redundant_telegram_fallbacks() {
         let engine = TransportEngine::new();
         engine.set_worker_domains(&["fallback.workers.dev".to_owned()]);
         let key = DcKey {
@@ -702,10 +814,19 @@ mod tests {
             media: false,
         };
         let candidates = engine.ordered_candidates(key);
-        assert_eq!(
-            candidates.last().unwrap().kind,
-            RouteKind::CloudflareWorker,
-            "third-party infrastructure must never be tried before Telegram itself"
+        assert_eq!(candidates[0].kind, RouteKind::TelegramIp);
+        assert_eq!(candidates[1].kind, RouteKind::CloudflareWorker);
+        let worker = candidates
+            .iter()
+            .position(|route| route.kind == RouteKind::CloudflareWorker)
+            .unwrap();
+        let dns = candidates
+            .iter()
+            .position(|route| route.kind == RouteKind::SystemDns)
+            .unwrap();
+        assert!(
+            worker < dns,
+            "an explicitly configured independent path must not wait for every blocked IP"
         );
     }
 
@@ -799,6 +920,215 @@ mod tests {
         ] {
             assert_ne!(route_label(0), kind.label());
         }
+    }
+
+    fn local_routes(count: usize) -> Vec<Route> {
+        (0..count)
+            .map(|index| Route {
+                connect_host: "127.0.0.1".to_owned(),
+                websocket_host: "localhost".to_owned(),
+                path: format!("/{index}"),
+                kind: RouteKind::TelegramIp,
+                port: 443,
+                secure: false,
+            })
+            .collect()
+    }
+
+    struct ActiveAttempt(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for ActiveAttempt {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_first_route_does_not_delay_a_working_fallback() {
+        let engine = TransportEngine::new();
+        *engine.forced_routes.lock().unwrap() = local_routes(3);
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Instant::now();
+        let (_, winner) = engine
+            .race_connections(
+                DcKey {
+                    dc: 2,
+                    media: false,
+                },
+                |route| {
+                    let active = active.clone();
+                    async move {
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let _active = ActiveAttempt(active);
+                        if route.path == "/1" {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                            Ok(())
+                        } else {
+                            std::future::pending::<Result<(), String>>().await
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(winner.route.path, "/1");
+        assert_eq!(started.elapsed(), FALLBACK_DELAY + Duration::from_millis(1));
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "losing attempts must be canceled"
+        );
+        assert_eq!(
+            engine.route_failures(),
+            0,
+            "cancellation is not a route failure"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_races_are_bounded_and_cooldown_prevents_redialing() {
+        let engine = TransportEngine::new();
+        *engine.forced_routes.lock().unwrap() = local_routes(8);
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let key = DcKey {
+            dc: 2,
+            media: false,
+        };
+        let error = engine
+            .race_connections(key, |_| {
+                let active = active.clone();
+                let peak = peak.clone();
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    let _active = ActiveAttempt(active);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Err::<(), _>("test handshake failure".to_owned())
+                }
+            })
+            .await
+            .unwrap_err();
+        assert!(error.contains("test handshake failure"));
+        assert_eq!(peak.load(Ordering::SeqCst), MAX_CONNECTING);
+        assert_eq!(engine.route_failures(), 8);
+        let error = engine
+            .race_connections(key, |_| {
+                panic!("a route in cooldown must never be dialed");
+                #[allow(unreachable_code)]
+                std::future::ready(Ok::<(), String>(()))
+            })
+            .await
+            .unwrap_err();
+        assert!(error.contains("повтор через"));
+        assert_eq!(engine.route_failures(), 8);
+        tokio::time::advance(FAILURE_BACKOFF_INITIAL).await;
+        assert_eq!(engine.ordered_candidates(key).len(), 8);
+    }
+
+    #[test]
+    fn an_upstream_failure_removes_preference_and_starts_cooldown() {
+        let engine = TransportEngine::new();
+        let key = DcKey {
+            dc: 2,
+            media: false,
+        };
+        let route = routes_for_dc(2, false)[0].clone();
+        engine.record_success(key, &route);
+        engine.report_route_failure(&ConnectedRoute {
+            route: route.clone(),
+        });
+        assert!(!engine.ordered_candidates(key).contains(&route));
+        assert!(!engine.health.lock().unwrap().preferred.contains_key(&key));
+        assert_eq!(engine.route_failures(), 1);
+    }
+
+    #[tokio::test]
+    async fn unsupported_dc_reports_missing_routes_without_dialing() {
+        let error = TransportEngine::new()
+            .connect(999, false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("нет маршрутов"));
+    }
+
+    async fn local_tls_route(
+        hostname: &str,
+    ) -> (
+        Route,
+        Arc<rustls::ClientConfig>,
+        tokio::task::JoinHandle<Option<String>>,
+    ) {
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der());
+        let cert = certificate.cert.der().clone();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key.into())
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+            let Ok(tls) = acceptor.accept(socket).await else {
+                return None;
+            };
+            let name = tls.get_ref().1.server_name().map(str::to_owned);
+            #[allow(clippy::result_large_err)]
+            let negotiate = |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                             mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                response.headers_mut().insert("Sec-WebSocket-Protocol", "binary".parse().unwrap());
+                Ok(response)
+            };
+            let _ = tokio_tungstenite::accept_hdr_async(tls, negotiate).await;
+            name
+        });
+        (
+            Route {
+                connect_host: "127.0.0.1".to_owned(),
+                websocket_host: hostname.to_owned(),
+                path: "/apiws".to_owned(),
+                kind: RouteKind::TelegramIp,
+                port,
+                secure: true,
+            },
+            client_config(roots),
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn pinned_ip_tls_uses_uri_hostname_for_sni_and_certificate_validation() {
+        let (route, config, server) = local_tls_route("localhost").await;
+        connect_route_with_config(&route, config).await.unwrap();
+        assert_eq!(server.await.unwrap().as_deref(), Some("localhost"));
+    }
+
+    #[tokio::test]
+    async fn tls_rejects_a_trusted_certificate_for_a_different_hostname() {
+        let (route, config, server) = local_tls_route("wrong.example").await;
+        let error = connect_route_with_config(&route, config).await.unwrap_err();
+        assert!(error.contains("TLS/WebSocket handshake"), "{error}");
+        assert!(server.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn production_roots_reject_an_untrusted_certificate() {
+        let (route, _, server) = local_tls_route("localhost").await;
+        let error = connect_route(&route).await.unwrap_err();
+        assert!(error.contains("TLS/WebSocket handshake"), "{error}");
+        assert!(server.await.unwrap().is_none());
+        assert!(
+            Arc::ptr_eq(&tls_config(), &tls_config()),
+            "reuse the TLS configuration"
+        );
     }
 
     #[tokio::test]

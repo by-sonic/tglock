@@ -58,6 +58,8 @@ let status: Status = {
 let settings: Settings = { lanMode: false, port: 1080, workerDomain: "" };
 let busy = false;
 let toastTimer: number | undefined;
+let toastMessage = "";
+let toastError = false;
 
 const icons = {
   arrowLeft: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>`,
@@ -115,7 +117,7 @@ function shell(content: string, pageClass = ""): string {
     <main class="app-shell ${pageClass}">
       <div class="drag-region" data-tauri-drag-region></div>
       ${content}
-      <div id="toast" class="toast" role="status"></div>
+      <div id="toast" class="toast${toastMessage ? " visible" : ""}${toastError ? " error" : ""}" role="status">${escapeHtml(toastMessage)}</div>
     </main>
   `;
 }
@@ -152,6 +154,11 @@ function renderHome(): void {
         <span class="button-arrow">→</span>
       </button>
 
+      ${status.running ? `<div class="connection-actions">
+        <button id="open-telegram" class="nav-button">Открыть Telegram</button>
+        <button id="copy-link" class="nav-button">Скопировать ссылку</button>
+      </div>` : ""}
+
       <div class="route-pill">
         <span class="route-pulse"></span>
         <span>${escapeHtml(status.route)}</span>
@@ -186,6 +193,8 @@ function renderHome(): void {
   `, "home-page");
 
   document.querySelector("#power")?.addEventListener("click", toggleProtection);
+  document.querySelector("#open-telegram")?.addEventListener("click", openTelegram);
+  document.querySelector("#copy-link")?.addEventListener("click", copyTelegramLink);
   document.querySelector("#copy-address")?.addEventListener("click", copyShareAddress);
   document.querySelector("#settings-nav")?.addEventListener("click", () => navigate("settings"));
   document.querySelector("#diagnostics-nav")?.addEventListener("click", () => navigate("diagnostics"));
@@ -326,6 +335,8 @@ function renderDiagnostics(): void {
         настроен неверно», а адрес такого клиента появится в журнале ниже.
       </p>
 
+      <button id="copy-diagnostics" class="save-button">Скопировать диагностику</button>
+
       <div class="log-panel">
         <div class="log-heading">
           <span>Последние события</span>
@@ -348,6 +359,7 @@ function renderDiagnostics(): void {
     </section>
   `, "subpage-shell");
 
+  document.querySelector("#copy-diagnostics")?.addEventListener("click", copyDiagnostics);
   document.querySelector("#back")?.addEventListener("click", () => navigate("home"));
 }
 
@@ -419,6 +431,46 @@ async function saveSettings(event: Event): Promise<void> {
   }
 }
 
+async function openTelegram(): Promise<void> {
+  try { await invoke("open_telegram"); }
+  catch (error) { showToast(String(error), true); }
+}
+
+async function copyTelegramLink(): Promise<void> {
+  try {
+    const link = await invoke<string>("get_telegram_link");
+    await navigator.clipboard.writeText(link);
+    showToast("Ссылка скопирована; она содержит секрет прокси");
+  } catch (error) {
+    showToast(`Не удалось скопировать ссылку: ${String(error)}`, true);
+  }
+}
+
+async function copyDiagnostics(): Promise<void> {
+  try {
+    // Public reports exclude proxy links, worker domains and free-form logs.
+    const report = {
+      application: "TGLock",
+      version: "2.0.0-beta.14",
+      running: status.running,
+      activeConnections: status.activeConnections,
+      tunnels: status.tunnels,
+      dataCenter: status.dataCenter,
+      route: status.route,
+      failures: status.failures,
+      routeFailures: status.routeFailures,
+      blocked: status.blocked,
+      unknownClients: status.unknownClients,
+      silentClients: status.silentClients,
+      uptimeSeconds: status.uptimeSeconds,
+      port: status.port,
+      lanMode: settings.lanMode,
+    };
+    await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
+    showToast("Диагностика скопирована без адресов и секретов");
+  } catch { showToast("Буфер обмена недоступен", true); }
+}
+
 async function copyShareAddress(): Promise<void> {
   const address = status.shareAddress;
   if (!address) return;
@@ -433,12 +485,17 @@ async function copyShareAddress(): Promise<void> {
 
 function showToast(message: string, error = false): void {
   window.clearTimeout(toastTimer);
+  toastMessage = message.replace(/^["']|["']$/g, "");
+  toastError = error;
   window.requestAnimationFrame(() => {
     const toast = document.querySelector<HTMLDivElement>("#toast");
     if (!toast) return;
     toast.textContent = message.replace(/^["']|["']$/g, "");
     toast.className = `toast visible${error ? " error" : ""}`;
-    toastTimer = window.setTimeout(() => toast.classList.remove("visible"), 2800);
+    toastTimer = window.setTimeout(() => {
+      toastMessage = "";
+      document.querySelector("#toast")?.classList.remove("visible");
+    }, 4500);
   });
 }
 

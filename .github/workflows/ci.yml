@@ -9,6 +9,19 @@ permissions:
   contents: read
 
 jobs:
+  windows-core:
+    name: Windows headless core
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy
+      - name: Lint CLI and core
+        run: cargo clippy --locked --no-default-features --features cli --all-targets -- -D warnings
+      - name: Test CLI and core
+        run: cargo test --locked --no-default-features --features cli --lib --bins
+
   rust:
     name: Rust checks
     runs-on: macos-latest
@@ -210,3 +223,6 @@ jobs:
 
       - name: Type-check and build
         run: npm ci && npm run build
+
+      - name: Worker contract and failure-path tests
+        run: npm run test:worker

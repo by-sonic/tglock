@@ -1,0 +1,54 @@
+name: Android APK
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: Android ARM64 debug APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK and NDK
+        run: |
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.0.13004108"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: aarch64-linux-android
+      - name: Install frontend dependencies
+        run: npm ci
+      # Tauri regenerates only ignored machine-specific Gradle glue. The
+      # checked-in Activity, service, manifest and Gradle project stay intact.
+      - name: Build installable APK with the bundled frontend
+        run: |
+          chmod +x gen/android/gradlew
+          npm run tauri -- android build --debug --apk --target aarch64 --ci
+      - name: Check APK signature and packaged Rust engine
+        run: |
+          apk=$(find gen/android/app/build/outputs/apk -name '*.apk' -print -quit)
+          test -n "$apk"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$apk"
+          unzip -l "$apk" | grep 'lib/arm64-v8a/libtglock_lib.so'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tglock-android-arm64-debug
+          path: gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14

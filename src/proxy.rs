@@ -738,7 +738,8 @@ async fn ws_tunnel(
 
     // Send buffered init as first frame
     ws_w.send(tungstenite::Message::Binary(init.to_vec()))
-        .await?;
+        .await
+        .map_err(|error| tunnel_route_error(stats, &connected, dc, &error.to_string()))?;
 
     // Ping приходит в половину, которая читает, а отвечать на него должна та,
     // которая пишет: владелец у отправляющей половины строго один.
@@ -752,9 +753,11 @@ async fn ws_tunnel(
     // сессия встаёт при живом туннеле (by-sonic/tglock#42, #32).
     let downstream = async {
         let mut crypto = downstream_crypto;
+        let mut received_payload = false;
         while let Some(message) = ws_r.next().await {
             match message {
                 Ok(tungstenite::Message::Binary(mut data)) => {
+                    received_payload |= !data.is_empty();
                     if let Some(crypto) = &mut crypto {
                         crypto.apply(data.as_mut());
                     }
@@ -766,9 +769,47 @@ async fn ws_tunnel(
                         break;
                     }
                 }
-                Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                Ok(tungstenite::Message::Close(frame)) => {
+                    // Telegram may send code 1000 even for transport errors;
+                    // the actual error is a signed decimal in the reason.
+                    // https://core.telegram.org/mtproto/transports#websocket
+                    let transport_error = frame.as_ref().is_some_and(|frame| {
+                        frame
+                            .reason
+                            .trim()
+                            .parse::<i32>()
+                            .is_ok_and(|code| code != 0)
+                            || frame.code != tungstenite::protocol::frame::coding::CloseCode::Normal
+                    });
+                    if !received_payload || transport_error {
+                        let reason = match frame {
+                            Some(frame) => {
+                                format!("WebSocket закрыт: {} {}", frame.code, frame.reason)
+                            }
+                            None => "WebSocket закрыт без ответа Telegram".to_owned(),
+                        };
+                        return Err(tunnel_route_error(stats, &connected, dc, &reason));
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(tunnel_route_error(
+                        stats,
+                        &connected,
+                        dc,
+                        &error.to_string(),
+                    ));
+                }
                 Ok(_) => {}
             }
+        }
+        if !received_payload {
+            return Err(tunnel_route_error(
+                stats,
+                &connected,
+                dc,
+                "WebSocket завершён без ответа Telegram",
+            ));
         }
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     };
@@ -779,19 +820,22 @@ async fn ws_tunnel(
         loop {
             tokio::select! {
                 read = tcp_r.read(&mut buf) => match read {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    Err(error) => return Err(error.into()),
                     Ok(read) => {
                         if let Some(crypto) = &mut crypto {
                             crypto.apply(&mut buf[..read]);
                         }
                         ws_w
                             .send(tungstenite::Message::Binary(buf[..read].to_vec()))
-                            .await?;
+                            .await
+                            .map_err(|error| tunnel_route_error(stats, &connected, dc, &error.to_string()))?;
                     }
                 },
                 payload = pong_rx.recv() => match payload {
                     Some(payload) => {
-                        ws_w.send(tungstenite::Message::Pong(payload)).await?;
+                        ws_w.send(tungstenite::Message::Pong(payload)).await
+                            .map_err(|error| tunnel_route_error(stats, &connected, dc, &error.to_string()))?;
                     }
                     None => break,
                 },
@@ -807,6 +851,21 @@ async fn ws_tunnel(
         result = &mut upstream => result?,
     }
     Ok(())
+}
+
+fn tunnel_route_error(
+    stats: &Stats,
+    connected: &crate::transport::ConnectedRoute,
+    dc: u16,
+    reason: &str,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    stats.transport.report_route_failure(connected);
+    let message = format!(
+        "Сбой туннеля DC{dc} через {}: {reason}",
+        connected.route.connect_host
+    );
+    stats.note(message.clone());
+    message.into()
 }
 
 async fn tcp_relay(a: TcpStream, b: TcpStream) {
@@ -953,6 +1012,7 @@ mod tests {
             .send(Message::Binary(wire))
             .await
             .map_err(|e| e.to_string())?;
+        websocket.close(None).await.map_err(|e| e.to_string())?;
         Ok((requested, init, request))
     }
 
@@ -1409,6 +1469,167 @@ mod tests {
 
         stats.stop();
         let _ = server.await.unwrap();
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn post_handshake_failures_are_reported_and_penalize_the_route() {
+        use futures_util::{SinkExt, StreamExt};
+        use tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+
+        // No reply, abrupt socket loss, and a Telegram transport error carried
+        // in a nominally normal WebSocket close all used to disappear silently.
+        for mode in 0..4 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let relay_port = listener.local_addr().unwrap().port();
+            let relay = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_hdr_async(
+                    tcp,
+                    |_: &Request, mut response: Response| {
+                        response
+                            .headers_mut()
+                            .insert("Sec-WebSocket-Protocol", "binary".parse().unwrap());
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(ws.next().await, Some(Ok(Message::Binary(_)))));
+                if mode >= 2 {
+                    ws.send(Message::Binary(vec![1, 2, 3, 4])).await.unwrap();
+                }
+                if mode != 1 {
+                    ws.close(Some(CloseFrame {
+                        code: CloseCode::Normal,
+                        reason: if mode == 2 { " -404 " } else { "" }.into(),
+                    }))
+                    .await
+                    .unwrap();
+                }
+            });
+            let stats = Stats::new();
+            stats.transport.force_local_route(relay_port);
+            let (port, server) = start_proxy(stats.clone(), false).await;
+            let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            client
+                .write_all(&unambiguous_client_init(&stats.secret, 2))
+                .await
+                .unwrap();
+            let mut received = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            relay.await.unwrap();
+            wait_until("connection task finished", || {
+                stats.active.load(Ordering::Relaxed) == 0
+            })
+            .await;
+            let failed = u32::from(mode != 3);
+            assert_eq!(
+                stats.ws_failures.load(Ordering::Relaxed),
+                failed,
+                "mode {mode}"
+            );
+            assert_eq!(stats.transport.route_failures(), failed, "mode {mode}");
+            let events = stats.drain_events();
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|event| event.contains("Сбой туннеля DC2 через 127.0.0.1")),
+                mode != 3
+            );
+            if mode == 2 {
+                assert!(events.iter().any(|event| event.contains("-404")));
+            }
+            stats.stop();
+            server.await.unwrap().unwrap();
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn fragmented_encrypted_upload_and_download_preserve_both_streams() {
+        use futures_util::{SinkExt, StreamExt};
+        let request: Vec<u8> = (0..131_072).map(|i| (i % 251) as u8).collect();
+        let response: Vec<u8> = (0..262_144).map(|i| (i % 239) as u8).collect();
+        let expected_request = request.clone();
+        let relay_response = response.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = listener.local_addr().unwrap().port();
+        let relay = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_: &Request, mut response: Response| {
+                    response
+                        .headers_mut()
+                        .insert("Sec-WebSocket-Protocol", "binary".parse().unwrap());
+                    Ok(response)
+                })
+                .await
+                .unwrap();
+            let init = match ws.next().await.unwrap().unwrap() {
+                Message::Binary(init) => init,
+                other => panic!("expected init: {other:?}"),
+            };
+            let mut peer = crate::mtproto::test_relay_peer(&init.try_into().unwrap());
+            let mut download = relay_response;
+            peer.encrypt(&mut download);
+            let (mut sink, mut stream) = ws.split();
+            let send = async {
+                for chunk in download.chunks(8191) {
+                    sink.send(Message::Binary(chunk.to_vec())).await.unwrap();
+                }
+            };
+            let receive = async {
+                let mut received = Vec::new();
+                while received.len() < expected_request.len() {
+                    if let Message::Binary(mut chunk) = stream.next().await.unwrap().unwrap() {
+                        peer.decrypt(&mut chunk);
+                        received.extend_from_slice(&chunk);
+                    }
+                }
+                assert_eq!(received, expected_request);
+            };
+            tokio::join!(send, receive);
+            sink.close().await.unwrap();
+        });
+        let stats = Stats::new();
+        stats.transport.force_local_route(relay_port);
+        let (port, server) = start_proxy(stats.clone(), false).await;
+        let init = unambiguous_client_init(&stats.secret, -4);
+        let mut peer = crate::mtproto::test_client_peer(&init, &stats.secret);
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // A mobile TCP stream can split the 64-byte init and subsequent data
+        // at arbitrary boundaries. WebSocket boundaries need not match these.
+        for chunk in init.chunks(7) {
+            client.write_all(chunk).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        let mut upload = request;
+        peer.encrypt(&mut upload);
+        let (mut reader, mut writer) = client.into_split();
+        let send = async {
+            for chunk in upload.chunks(137) {
+                writer.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        };
+        let receive = async {
+            let mut received = vec![0; response.len()];
+            reader.read_exact(&mut received).await.unwrap();
+            peer.decrypt(&mut received);
+            assert_eq!(received, response);
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(send, receive);
+            relay.await.unwrap();
+        })
+        .await
+        .expect("both encrypted directions must make progress");
+        stats.stop();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

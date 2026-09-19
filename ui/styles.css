@@ -897,3 +897,21 @@ input:disabled {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
 }
+
+/* Keep actions reachable with mobile safe areas and accessibility text scaling. */
+.app-shell { overflow-y: auto; }
+.home, .subpage { height: auto; min-height: 100%; }
+.connection-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+.connection-actions .nav-button { min-height: 44px; padding: 8px 12px; }
+@media (max-width: 500px) {
+  .home { padding: max(32px, env(safe-area-inset-top)) 20px max(24px, env(safe-area-inset-bottom)); }
+  .subpage { padding-left: 20px; padding-right: 20px; padding-top: max(28px, env(safe-area-inset-top)); }
+  .drag-region { display: none; }
+  .share-address { overflow-wrap: anywhere; }
+}

@@ -2,7 +2,8 @@
 /dist
 /dist-ui
 /node_modules
-/gen
+/gen/*
+!/gen/android/
 /tools
 *.zip
 .claude/

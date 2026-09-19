@@ -1,7 +1,7 @@
 //! TGLock core: the MTProto/WebSocket transport shared by the desktop GUI and
 //! the headless CLI.
 //!
-//! Nothing in this crate depends on Tauri or on a windowing system, so the
+//! With the `gui` feature disabled this crate does not depend on Tauri, so the
 //! `tglock-cli` binary can be built with `--no-default-features` on a server
 //! that has neither a GPU nor a monitor.
 
@@ -14,3 +14,7 @@ pub mod transport;
 /// Настройки headless-версии: файл конфигурации и сведение с флагами.
 #[cfg(feature = "cli")]
 pub mod cli_settings;
+
+/// Desktop and Android graphical application; absent from headless builds.
+#[cfg(feature = "gui")]
+pub mod gui;

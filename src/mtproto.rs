@@ -2,9 +2,7 @@ use aes::Aes256;
 use cipher::{KeyIvInit, StreamCipher};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
-use std::path::Path;
-#[cfg(not(test))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 type AesCtr = ctr::Ctr128BE<Aes256>;
 
@@ -119,6 +117,12 @@ impl StoredSecret {
 /// Секрет — половина ссылки `tg://proxy`, поэтому сервис, придумывающий новый
 /// при каждом старте, отключает всех уже настроенных клиентов.
 pub fn load_or_create_secret_at(path: &Path) -> StoredSecret {
+    load_or_create_secret_at_with_migration(path, None)
+}
+
+/// Preserve desktop proxy links when the GUI moves to Tauri's app directory.
+/// The legacy file remains intact, including when copying it fails.
+pub fn load_or_create_secret_at_with_migration(path: &Path, legacy: Option<&Path>) -> StoredSecret {
     if let Ok(value) = std::fs::read_to_string(path) {
         if let Some(value) = parse_secret_hex(value.trim()) {
             return StoredSecret {
@@ -128,7 +132,10 @@ pub fn load_or_create_secret_at(path: &Path) -> StoredSecret {
         }
     }
 
-    let value = generate_secret();
+    let value = legacy
+        .and_then(|legacy| std::fs::read_to_string(legacy).ok())
+        .and_then(|value| parse_secret_hex(value.trim()))
+        .unwrap_or_else(generate_secret);
     let write_error = store_secret(path, &secret_hex(&value))
         .err()
         .map(|error| format!("{}: {error}", path.display()));
@@ -146,7 +153,7 @@ fn store_secret(path: &Path, value: &str) -> std::io::Result<()> {
 
 #[cfg(not(test))]
 pub fn load_or_create_secret() -> StoredSecret {
-    match secret_path() {
+    match legacy_secret_path() {
         Some(path) => load_or_create_secret_at(&path),
         None => StoredSecret {
             value: generate_secret(),
@@ -155,8 +162,7 @@ pub fn load_or_create_secret() -> StoredSecret {
     }
 }
 
-#[cfg(not(test))]
-fn secret_path() -> Option<PathBuf> {
+pub fn legacy_secret_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("APPDATA")
@@ -221,7 +227,7 @@ pub fn parse_secret(value: &str) -> Option<[u8; 16]> {
 }
 
 fn parse_secret_hex(value: &str) -> Option<[u8; 16]> {
-    if value.len() != 32 {
+    if value.len() != 32 || !value.is_ascii() {
         return None;
     }
     let mut secret = [0; 16];
@@ -300,6 +306,7 @@ fn is_reserved_init(init: &[u8; INIT_LEN]) -> bool {
         || &init[..4] == b"HEAD"
         || &init[..4] == b"POST"
         || &init[..4] == b"GET "
+        || &init[..4] == b"OPTI"
         || init[..4] == [0xee; 4]
         || init[..4] == [0xdd; 4]
         || init[..4] == [0x16, 0x03, 0x01, 0x02]
@@ -682,9 +689,46 @@ mod tests {
             "00112233445566778899aabbccddee",     // 30 символов
             "00112233445566778899aabbccddeeffff", // 34 символа
             "zz112233445566778899aabbccddeeff",   // не hex
+            "0я00000000000000000000000000000",    // 32 bytes, UTF-8 boundary at byte 2
         ] {
             assert!(parse_secret(bad).is_none(), "{bad:?} должен быть отвергнут");
         }
+    }
+
+    #[test]
+    fn android_obfuscated2_vector_survives_fragmented_translation() {
+        // Independently generated with Node/OpenSSL AES-256-CTR and SHA-256,
+        // following Telegram Android Connection.cpp sendData/encryptKeyWithSecret.
+        // Fixed wire bytes avoid a symmetric mistake in the test peer helpers.
+        fn bytes(hex: &str) -> Vec<u8> {
+            hex.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect()
+        }
+        let init: [u8; 64] = bytes(concat!(
+            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223",
+            "2425262728292a2b2c2d2e2f303132333435363738043de6c25808afa3"
+        ))
+        .try_into()
+        .unwrap();
+        let parsed = parse_client_init(&init, &[42; 16]).unwrap();
+        assert_eq!(parsed.dc, 4);
+        assert!(parsed.media);
+        let mut relay = test_relay_peer(&parsed.relay_init);
+        let (mut upstream, mut downstream) = parsed.crypto.split();
+        let mut request = bytes("31fc48bfc21f9210a57fd63ac344ae50a3a23620");
+        for chunk in request.chunks_mut(3) {
+            upstream.apply(chunk);
+            relay.decrypt(chunk);
+        }
+        assert_eq!(request, bytes("10000000112233445566778899aabbccddeeff00"));
+        let mut reply = bytes("04000000ecfeffff");
+        relay.encrypt(&mut reply);
+        for chunk in reply.chunks_mut(1) {
+            downstream.apply(chunk);
+        }
+        assert_eq!(reply, bytes("d5a69e839ec08ebf"));
     }
 
     #[test]
@@ -697,5 +741,71 @@ mod tests {
             ])
         );
         assert_eq!(parse_secret_hex("not-a-secret"), None);
+    }
+
+    #[test]
+    fn secret_migration_keeps_legacy_links_and_prefers_existing_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "tglock-migration-{}",
+            secret_hex(&generate_secret())
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let legacy = root.join("legacy");
+        let destination = root.join("secret");
+        std::fs::write(&legacy, secret_hex(&[17; 16])).unwrap();
+        let first = load_or_create_secret_at_with_migration(&destination, Some(&legacy));
+        assert_eq!(first.value, [17; 16]);
+        assert!(first.is_persistent());
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            secret_hex(&[17; 16])
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        std::fs::write(&legacy, secret_hex(&[23; 16])).unwrap();
+        let second = load_or_create_secret_at_with_migration(&destination, Some(&legacy));
+        assert_eq!(
+            second.value, [17; 16],
+            "an existing destination wins on restart"
+        );
+        std::fs::remove_file(destination).unwrap();
+        std::fs::remove_file(legacy).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn failed_migration_reports_error_but_does_not_rotate_the_legacy_secret() {
+        let root = std::env::temp_dir().join(format!(
+            "tglock-migration-fail-{}",
+            secret_hex(&generate_secret())
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let legacy = root.join("legacy");
+        let blocker = root.join("blocker");
+        std::fs::write(&legacy, secret_hex(&[29; 16])).unwrap();
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let destination = blocker.join("secret");
+        for _ in 0..2 {
+            let stored = load_or_create_secret_at_with_migration(&destination, Some(&legacy));
+            assert_eq!(stored.value, [29; 16]);
+            assert!(stored.write_error.is_some());
+        }
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            secret_hex(&[29; 16])
+        );
+        std::fs::remove_file(blocker).unwrap();
+        std::fs::remove_file(legacy).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 }
