@@ -234,3 +234,6 @@ jobs:
 
       - name: Worker contract and failure-path tests
         run: npm run test:worker
+
+      - name: Offline protocol probe parser checks
+        run: node scripts/probe_proxy.mjs --self-test

@@ -1,5 +1,5 @@
 use crate::config::ListenConfig;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -71,15 +71,17 @@ pub struct Stats {
     shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
-/// Однократные сообщения о том, что происходит с подключениями.
+/// Сообщения о подключениях со склейкой недавних повторов.
 ///
-/// Однократные намеренно: отклонённый адрес повторяется десятки раз в минуту,
+/// Склейка намеренна: отклонённый адрес повторяется десятки раз в минуту,
 /// и без склейки журнал превратился бы в одну строку, повторённую сто раз.
 /// Число повторов при этом не теряется — оно в счётчике `blocked`.
 #[derive(Default)]
 struct Events {
     pending: VecDeque<String>,
-    seen: HashSet<String>,
+    // FIFO of recent distinct messages, independent from the consumer queue.
+    // Once full, evict the oldest entry rather than silencing all future logs.
+    seen: VecDeque<String>,
 }
 
 /// Сколько разных событий помним, чтобы буфер не рос без границы.
@@ -132,12 +134,19 @@ impl Stats {
         })
     }
 
-    /// Запомнить событие, если такого ещё не было.
+    /// Запомнить событие, если его нет среди последних EVENT_LIMIT разных сообщений.
     pub fn note(&self, message: impl Into<String>) {
         let message = message.into();
         let mut events = self.events.lock().unwrap();
-        if events.seen.len() >= EVENT_LIMIT || !events.seen.insert(message.clone()) {
+        if events.seen.contains(&message) {
             return;
+        }
+        if events.seen.len() == EVENT_LIMIT {
+            events.seen.pop_front();
+        }
+        events.seen.push_back(message.clone());
+        if events.pending.len() == EVENT_LIMIT {
+            events.pending.pop_front();
         }
         events.pending.push_back(message);
     }
@@ -683,13 +692,9 @@ fn dc_from_init(init: &[u8; 64]) -> Option<(u16, bool)> {
 
 // -- WebSocket tunnel -------------------------------------------------------
 
-/// Keeps `Stats::ws` equal to the number of *established* tunnels.
-///
-/// Counting attempts instead would let the interface announce «Telegram на
-/// связи» while the WebSocket handshake is still failing over between routes,
-/// which takes seconds per route. Reporting a working tunnel that does not
-/// exist yet is the whole reason users saw «прокси подключён, а Telegram не
-/// работает».
+/// Counts opened upstream transports, not pending connection attempts.
+/// WebSocket routes have completed their upgrade; native CDN routes have an
+/// open TCP socket. Neither alone proves a successful Telegram protocol reply.
 struct EstablishedTunnel<'a>(&'a Stats);
 
 impl<'a> EstablishedTunnel<'a> {
@@ -715,7 +720,7 @@ async fn ws_tunnel(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::{SinkExt, StreamExt};
 
-    let (ws, connected) = match stats.transport.connect(dc, media).await {
+    let (connection, connected) = match stats.transport.connect(dc, media).await {
         Ok(connected) => connected,
         Err(error) => {
             // Единственное место, где известно, ПОЧЕМУ туннеля нет. Раньше
@@ -728,6 +733,13 @@ async fn ws_tunnel(
     };
     let _tunnel = EstablishedTunnel::new(stats);
     stats.note_tunnel(dc, connected.route.kind.ui_code());
+
+    let ws = match connection {
+        crate::transport::TelegramConnection::WebSocket(ws) => ws,
+        crate::transport::TelegramConnection::Tcp(remote) => {
+            return cdn_tcp_tunnel(tcp, remote, init, crypto, stats, &connected, dc).await;
+        }
+    };
 
     let (mut tcp_r, mut tcp_w) = tokio::io::split(tcp);
     let (mut ws_w, mut ws_r) = ws.split();
@@ -851,6 +863,79 @@ async fn ws_tunnel(
         result = &mut upstream => result?,
     }
     Ok(())
+}
+
+/// DC203's pinned CDN endpoint speaks obfuscated MTProto over TCP. Preserve the
+/// same generated init and independent CTR streams used for a WebSocket route.
+/// The transport engine restricts this connection to the exact CDN destination.
+async fn cdn_tcp_tunnel(
+    client: TcpStream,
+    mut remote: TcpStream,
+    init: &[u8; 64],
+    crypto: Option<crate::mtproto::CryptoContext>,
+    stats: &Stats,
+    connected: &crate::transport::ConnectedRoute,
+    dc: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    remote
+        .write_all(init)
+        .await
+        .map_err(|error| tunnel_route_error(stats, connected, dc, &error.to_string()))?;
+    let (mut client_r, mut client_w) = client.into_split();
+    let (mut remote_r, mut remote_w) = remote.into_split();
+    let (upstream_crypto, downstream_crypto) = match crypto.map(|crypto| crypto.split()) {
+        Some((upstream, downstream)) => (Some(upstream), Some(downstream)),
+        None => (None, None),
+    };
+    let upstream = async {
+        let mut crypto = upstream_crypto;
+        let mut buffer = vec![0; 65536];
+        loop {
+            let read = client_r.read(&mut buffer).await?;
+            if read == 0 {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+            }
+            if let Some(crypto) = &mut crypto {
+                crypto.apply(&mut buffer[..read]);
+            }
+            remote_w
+                .write_all(&buffer[..read])
+                .await
+                .map_err(|error| tunnel_route_error(stats, connected, dc, &error.to_string()))?;
+        }
+    };
+    let downstream = async {
+        let mut crypto = downstream_crypto;
+        let mut buffer = vec![0; 65536];
+        let mut received_payload = false;
+        loop {
+            let read = remote_r
+                .read(&mut buffer)
+                .await
+                .map_err(|error| tunnel_route_error(stats, connected, dc, &error.to_string()))?;
+            if read == 0 {
+                return if received_payload {
+                    Ok(())
+                } else {
+                    Err(tunnel_route_error(
+                        stats,
+                        connected,
+                        dc,
+                        "CDN TCP закрыт без ответа Telegram",
+                    ))
+                };
+            }
+            received_payload = true;
+            if let Some(crypto) = &mut crypto {
+                crypto.apply(&mut buffer[..read]);
+            }
+            client_w.write_all(&buffer[..read]).await?;
+        }
+    };
+    tokio::select! {
+        result = upstream => result,
+        result = downstream => result,
+    }
 }
 
 fn tunnel_route_error(
@@ -1098,6 +1183,52 @@ mod tests {
             stats.drain_events().is_empty(),
             "забранное событие не приходит повторно"
         );
+    }
+
+    #[test]
+    fn diagnostics_keep_new_events_after_the_first_sixty_four() {
+        let stats = Stats::with_secret([0; 16]);
+        for index in 0..=EVENT_LIMIT {
+            stats.note(format!("route failure {index}"));
+        }
+        {
+            let events = stats.events.lock().unwrap();
+            assert_eq!(events.seen.len(), EVENT_LIMIT);
+            assert_eq!(events.pending.len(), EVENT_LIMIT);
+        }
+        let events = stats.drain_events();
+        assert_eq!(events.first().unwrap(), "route failure 1");
+        assert_eq!(
+            events.last().unwrap(),
+            &format!("route failure {EVENT_LIMIT}")
+        );
+
+        // Draining must not discard deduplication history, but must not stop
+        // the next new error from reaching the operator either.
+        stats.note(format!("route failure {EVENT_LIMIT}"));
+        stats.note("a new upstream error");
+        assert_eq!(stats.drain_events(), vec!["a new upstream error"]);
+    }
+
+    #[test]
+    fn an_evicted_event_can_be_reported_again_without_repeating_recent_events() {
+        let stats = Stats::with_secret([0; 16]);
+        stats.note("original error");
+        assert_eq!(stats.drain_events(), vec!["original error"]);
+        stats.note("original error");
+        assert!(stats.drain_events().is_empty());
+
+        // More distinct events than the retained history used to silence
+        // diagnostics permanently, even when the frontend drained every one.
+        for index in 0..EVENT_LIMIT * 2 {
+            let message = format!("error {index}");
+            stats.note(message.clone());
+            assert_eq!(stats.drain_events(), vec![message]);
+        }
+        stats.note("original error");
+        stats.note("original error");
+        assert_eq!(stats.drain_events(), vec!["original error"]);
+        assert_eq!(stats.events.lock().unwrap().seen.len(), EVENT_LIMIT);
     }
 
     /// Диагностика обязана показывать пару из одного соединения.
@@ -1548,9 +1679,53 @@ mod tests {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     #[tokio::test]
     async fn fragmented_encrypted_upload_and_download_preserve_both_streams() {
+        check_fragmented_encrypted_duplex(false).await;
+    }
+
+    #[tokio::test]
+    async fn cdn_tcp_preserves_fragmented_encrypted_duplex_and_clean_close() {
+        check_fragmented_encrypted_duplex(true).await;
+    }
+
+    #[tokio::test]
+    async fn cdn_tcp_closing_before_a_reply_is_reported_as_a_route_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = listener.local_addr().unwrap().port();
+        let relay = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut init = [0; INIT_LEN];
+            stream.read_exact(&mut init).await.unwrap();
+        });
+        let stats = Stats::new();
+        stats.transport.force_local_route_with(
+            relay_port,
+            crate::transport::RouteKind::TelegramTcp,
+            String::new(),
+        );
+        let (port, server) = start_proxy(stats.clone(), false).await;
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client
+            .write_all(&unambiguous_client_init(&stats.secret, 203))
+            .await
+            .unwrap();
+        wait_until("CDN failure is counted", || {
+            stats.ws_failures.load(Ordering::Relaxed) == 1
+        })
+        .await;
+        assert_eq!(stats.transport.route_failures(), 1);
+        assert!(stats
+            .drain_events()
+            .iter()
+            .any(|event| event.contains("CDN TCP закрыт без ответа")));
+        relay.await.unwrap();
+        stats.stop();
+        server.await.unwrap().unwrap();
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn check_fragmented_encrypted_duplex(raw_tcp: bool) {
         use futures_util::{SinkExt, StreamExt};
         let request: Vec<u8> = (0..131_072).map(|i| (i % 251) as u8).collect();
         let response: Vec<u8> = (0..262_144).map(|i| (i % 239) as u8).collect();
@@ -1559,7 +1734,30 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay_port = listener.local_addr().unwrap().port();
         let relay = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            if raw_tcp {
+                let mut init = [0; INIT_LEN];
+                tcp.read_exact(&mut init).await.unwrap();
+                let mut peer = crate::mtproto::test_relay_peer(&init);
+                let mut download = relay_response;
+                peer.encrypt(&mut download);
+                let (mut reader, mut writer) = tcp.into_split();
+                let send = async {
+                    for chunk in download.chunks(8191) {
+                        writer.write_all(chunk).await.unwrap();
+                        tokio::task::yield_now().await;
+                    }
+                };
+                let receive = async {
+                    let mut received = vec![0; expected_request.len()];
+                    reader.read_exact(&mut received).await.unwrap();
+                    peer.decrypt(&mut received);
+                    assert_eq!(received, expected_request);
+                };
+                tokio::join!(send, receive);
+                writer.shutdown().await.unwrap();
+                return;
+            }
             let mut ws =
                 tokio_tungstenite::accept_hdr_async(tcp, |_: &Request, mut response: Response| {
                     response
@@ -1596,9 +1794,17 @@ mod tests {
             sink.close().await.unwrap();
         });
         let stats = Stats::new();
-        stats.transport.force_local_route(relay_port);
+        if raw_tcp {
+            stats.transport.force_local_route_with(
+                relay_port,
+                crate::transport::RouteKind::TelegramTcp,
+                String::new(),
+            );
+        } else {
+            stats.transport.force_local_route(relay_port);
+        }
         let (port, server) = start_proxy(stats.clone(), false).await;
-        let init = unambiguous_client_init(&stats.secret, -4);
+        let init = unambiguous_client_init(&stats.secret, if raw_tcp { 203 } else { -4 });
         let mut peer = crate::mtproto::test_client_peer(&init, &stats.secret);
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         // A mobile TCP stream can split the 64-byte init and subsequent data
@@ -1628,6 +1834,14 @@ mod tests {
         })
         .await
         .expect("both encrypted directions must make progress");
+        assert_eq!(stats.ws_failures.load(Ordering::Relaxed), 0);
+        if raw_tcp {
+            assert_eq!(
+                stats.last_route(),
+                crate::transport::RouteKind::TelegramTcp.ui_code()
+            );
+            assert_eq!(stats.last_dc(), 203);
+        }
         stats.stop();
         server.await.unwrap().unwrap();
     }
