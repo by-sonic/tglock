@@ -111,7 +111,8 @@ jobs:
             - **Сервер, контейнер, машина без монитора** — `tglock-cli-*`: то же самое, но без графического интерфейса
 
             Если Windows ругается на файл — [почему так и что с этим делать](https://github.com/by-sonic/tglock#-антивирус-ругается-smartscreen-предупреждает-virustotal-показывает-детекты).
-          releaseDraft: false
+          # Publish only after every platform, CLI and exact-commit APK is verified.
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
 
@@ -162,6 +163,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
+          draft: true
           files: arm64-cli/*
 
   cli:
@@ -229,5 +231,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
+          draft: true
           prerelease: false
           files: ${{ matrix.asset }}

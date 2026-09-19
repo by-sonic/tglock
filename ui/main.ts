@@ -451,7 +451,7 @@ async function copyDiagnostics(): Promise<void> {
     // Public reports exclude proxy links, worker domains and free-form logs.
     const report = {
       application: "TGLock",
-      version: "2.0.0-beta.14",
+      version: "2.0.0-beta.15",
       running: status.running,
       activeConnections: status.activeConnections,
       tunnels: status.tunnels,
