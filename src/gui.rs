@@ -266,7 +266,7 @@ async fn start_proxy(
 }
 
 #[tauri::command]
-async fn stop_proxy(state: State<'_, AppState>) -> StatusSnapshot {
+async fn stop_proxy(state: State<'_, AppState>) -> Result<StatusSnapshot, String> {
     let mut task = state.task.lock().await;
     state.stats.stop();
     if let Some(worker) = task.take() {
@@ -275,7 +275,7 @@ async fn stop_proxy(state: State<'_, AppState>) -> StatusSnapshot {
     *state.active_listen.lock().unwrap() = None;
     *state.started_at.lock().unwrap() = None;
     state.log("Защита выключена", false);
-    state.snapshot()
+    Ok(state.snapshot())
 }
 
 fn telegram_link(state: &AppState) -> Result<String, String> {
