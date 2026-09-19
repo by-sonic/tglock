@@ -49,7 +49,17 @@ report-copy control includes only counters, port, route and mode.
 CI uses Java 17, Android SDK 36, NDK 28, Rust 1.88, and the locked npm/Rust
 manifests. `npm run tauri -- android build --debug --apk --target aarch64 --ci`
 bundles the frontend inside a signed APK; no development web server is required.
-CI verifies the signature and the presence of the ARM64 Rust library.
+CI verifies the signature and the presence of each architecture's Rust library.
+The x86_64 build is installed on an Android 15 emulator. The bounded smoke checks
+Activity launch, process survival, and crash/ANR logs. When UIAutomator exposes
+the WebView buttons, it also checks Start, five seconds in the background, Stop,
+restart, and explicit force-stop/relaunch. It verifies the foreground service and
+performs a real SOCKS5 greeting through ADB port forwarding to the Rust listener.
+If buttons are inaccessible after a bounded wait, CI explicitly reports the
+lifecycle checks as skipped; a launch-only pass is not lifecycle evidence.
+`android-emulator-smoke-evidence` retains the exact result, UI dumps, service
+state and logcat. This does not test automatic low-memory eviction, battery
+behavior, Telegram connectivity, or a physical phone.
 
 Checked-in `gen/android` contains the native source and Gradle wrapper. Tauri's
 machine-specific generated glue, SDK paths, native build output and signing files
