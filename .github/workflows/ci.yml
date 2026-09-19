@@ -21,6 +21,14 @@ jobs:
         run: cargo clippy --locked --no-default-features --features cli --all-targets -- -D warnings
       - name: Test CLI and core
         run: cargo test --locked --no-default-features --features cli --lib --bins
+      - name: Build CLI for manual Windows verification
+        run: cargo build --locked --no-default-features --features cli --bin tglock-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tglock-cli-windows-debug
+          path: target/debug/tglock-cli.exe
+          if-no-files-found: error
+          retention-days: 14
 
   rust:
     name: Rust checks
