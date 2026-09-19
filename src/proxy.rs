@@ -735,7 +735,7 @@ async fn ws_tunnel(
     stats.note_tunnel(dc, connected.route.kind.ui_code());
 
     let ws = match connection {
-        crate::transport::TelegramConnection::WebSocket(ws) => ws,
+        crate::transport::TelegramConnection::WebSocket(ws) => *ws,
         crate::transport::TelegramConnection::Tcp(remote) => {
             return cdn_tcp_tunnel(tcp, remote, init, crypto, stats, &connected, dc).await;
         }
