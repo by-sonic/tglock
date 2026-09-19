@@ -45,7 +45,10 @@ def ui_dump(label):
 
 def label_node(tree, label):
     for node in tree.iter("node"):
-        if label in (node.get("text", ""), node.get("content-desc", "")):
+        # Android aggregates the decorative arrow into the button's accessible
+        # text (observed in the API35 CI dump). Accept only that exact suffix.
+        names = (node.get("text", "").strip(), node.get("content-desc", "").strip())
+        if any(name in (label, f"{label} →") for name in names):
             bounds = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.get("bounds", ""))
             if bounds:
                 x1, y1, x2, y2 = map(int, bounds.groups())
