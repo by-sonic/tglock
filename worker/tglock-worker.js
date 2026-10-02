@@ -85,6 +85,7 @@ export default {
     }
 
     const [client, server] = Object.values(new WebSocketPair());
+    server.binaryType = "arraybuffer";
     server.accept();
 
     const writer = upstream.writable.getWriter();
