@@ -22,7 +22,7 @@ async function fixture({ opened = Promise.resolve(), write, timeout = false } = 
   const events = new Map();
   const state = { connects: 0, accepted: false, socketCloses: 0, sent: [], closes: [] };
   const server = {
-    accept() { state.accepted = true; },
+    accept() { state.accepted = true; state.binaryTypeOnAccept = this.binaryType; },
     addEventListener(name, callback) { events.set(name, callback); },
     close(code, reason) { state.closes.push({ code, reason }); },
     send(chunk) { state.sent.push(Array.from(chunk)); },
@@ -41,7 +41,7 @@ async function fixture({ opened = Promise.resolve(), write, timeout = false } = 
     },
   };
   const context = vm.createContext({
-    URL, Uint8Array, ArrayBuffer, setTimeout: timeout ? (fn) => setTimeout(fn, 0) : setTimeout, clearTimeout,
+    URL, Uint8Array, ArrayBuffer, Blob, setTimeout: timeout ? (fn) => setTimeout(fn, 0) : setTimeout, clearTimeout,
     Response: class {
       constructor(body, options) { this.body = body; Object.assign(this, options); }
     },
@@ -130,6 +130,27 @@ test("serialize binary writes, preserve bytes and view offsets", async () => {
   firstWrite.resolve();
   await tick();
   assert.deepEqual(f.writes, [[1, 2], [3, 4]]);
+  f.event("close");
+});
+
+test("binary frames arrive as ArrayBuffer on new compatibility dates", async () => {
+  // With compatibility date 2026-03-17+ Cloudflare delivers Blob unless
+  // binaryType is set before accept(); the Worker then closed every tunnel
+  // with 1003 right after the handshake (#61).
+  const f = await fixture();
+  await f.fetch();
+  assert.equal(f.state.binaryTypeOnAccept, "arraybuffer");
+  f.event("close");
+});
+
+test("Blob frames are still relayed in order, never closed as text", async () => {
+  const f = await fixture();
+  await f.fetch();
+  f.message(new Blob([new Uint8Array([7, 8])]));
+  f.message(new Uint8Array([9]).buffer);
+  for (let i = 0; i < 5; i++) await tick();
+  assert.deepEqual(f.writes, [[7, 8], [9]]);
+  assert.deepEqual(f.state.closes, []);
   f.event("close");
 });
 
