@@ -37,7 +37,11 @@ def ui_dump(label):
     # Dump first, then read the file; never tap coordinates inferred from a
     # screenshot, a previous Activity, or assumed phone dimensions.
     adb("shell", "rm", "-f", "/sdcard/tglock-ui.xml")
-    adb("shell", "uiautomator", "dump", "/sdcard/tglock-ui.xml")
+    status = adb("shell", "uiautomator", "dump", "/sdcard/tglock-ui.xml", check=False)
+    if not adb("shell", "ls", "/sdcard/tglock-ui.xml", check=False).endswith("tglock-ui.xml"):
+        # On a loaded emulator UIAutomator intermittently reports "could not get
+        # idle state" and writes nothing. That is the tool, not the app.
+        raise subprocess.SubprocessError(f"uiautomator dump failed: {status}")
     text = adb("shell", "cat", "/sdcard/tglock-ui.xml")
     (EVIDENCE / f"{label}.xml").write_text(text, encoding="utf-8")
     return ET.fromstring(text)
@@ -58,8 +62,12 @@ def label_node(tree, label):
 
 
 def tap_label(label, stage):
-    for attempt in range(3):
-        point = label_node(ui_dump(f"{stage}-{attempt}"), label)
+    for attempt in range(5):
+        try:
+            point = label_node(ui_dump(f"{stage}-{attempt}"), label)
+        except (subprocess.SubprocessError, ET.ParseError) as error:
+            (EVIDENCE / f"{stage}-{attempt}.error.txt").write_text(str(error), encoding="utf-8")
+            point = None
         if point is not None:
             adb("shell", "input", "tap", str(point[0]), str(point[1]))
             return
