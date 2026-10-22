@@ -117,28 +117,36 @@ export default {
 
     server.addEventListener("message", (event) => {
       if (closed) return;
-      if (!(event.data instanceof ArrayBuffer) && !ArrayBuffer.isView(event.data)) {
+      const data = event.data;
+      // С compatibility date 2026-03-17 бинарные кадры приходят как Blob, если
+      // binaryType не "arraybuffer". Свойство выставлено выше; Blob всё равно
+      // принимается — на случай рантайма, который его не учитывает. Раньше такой
+      // кадр закрывал туннель кодом 1003 сразу после рукопожатия.
+      const blob = typeof Blob !== "undefined" && data instanceof Blob;
+      if (!blob && !(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) {
         shutdown(1003, "binary messages required");
         return;
       }
-      const chunk = event.data instanceof ArrayBuffer
-        ? new Uint8Array(event.data)
-        : new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength);
-      if (pendingBytes + chunk.byteLength > MAX_PENDING_BYTES || pendingMessages >= MAX_PENDING_MESSAGES) {
+      const chunk = blob ? null : data instanceof ArrayBuffer
+        ? new Uint8Array(data)
+        : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      const size = blob ? data.size : chunk.byteLength;
+      if (pendingBytes + size > MAX_PENDING_BYTES || pendingMessages >= MAX_PENDING_MESSAGES) {
         shutdown(1009, "Telegram write queue full");
         return;
       }
-      pendingBytes += chunk.byteLength;
+      pendingBytes += size;
       pendingMessages += 1;
       pending = pending
         .then(async () => {
           if (closed) return;
+          const bytes = chunk || new Uint8Array(await data.arrayBuffer());
           await writer.ready;
-          if (!closed) await writer.write(chunk);
+          if (!closed) await writer.write(bytes);
         })
         .catch(() => shutdown(1011, "Telegram write failed"))
         .finally(() => {
-          pendingBytes -= chunk.byteLength;
+          pendingBytes -= size;
           pendingMessages -= 1;
         });
     });

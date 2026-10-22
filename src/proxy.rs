@@ -795,9 +795,7 @@ async fn ws_tunnel(
                     });
                     if !received_payload || transport_error {
                         let reason = match frame {
-                            Some(frame) => {
-                                format!("WebSocket закрыт: {} {}", frame.code, frame.reason)
-                            }
+                            Some(frame) => describe_ws_close(frame.code.into(), &frame.reason),
                             None => "WebSocket закрыт без ответа Telegram".to_owned(),
                         };
                         return Err(tunnel_route_error(stats, &connected, dc, &reason));
@@ -938,6 +936,24 @@ async fn cdn_tcp_tunnel(
     }
 }
 
+/// Текст для журнала, когда WebSocket закрыла другая сторона.
+///
+/// `1003 binary messages required` отвечает только старый скрипт Worker'а: с
+/// compatibility date 2026-03-17 Cloudflare отдаёт бинарные кадры как Blob, и
+/// такой скрипт рвал каждый туннель сразу после рукопожатия (by-sonic/tglock#61).
+/// Обновление TGLock код в чужом Cloudflare-аккаунте не меняет, поэтому
+/// пользователю надо сказать прямо, что делать.
+fn describe_ws_close(code: u16, reason: &str) -> String {
+    let mut text = format!("WebSocket закрыт: {code} {reason}");
+    if code == 1003 && reason.contains("binary messages required") {
+        text.push_str(
+            " — скрипт Cloudflare Worker устарел: опубликуйте заново \
+             worker/tglock-worker.js из репозитория",
+        );
+    }
+    text
+}
+
 fn tunnel_route_error(
     stats: &Stats,
     connected: &crate::transport::ConnectedRoute,
@@ -968,6 +984,17 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn an_outdated_worker_close_says_to_redeploy_it() {
+        let outdated = describe_ws_close(1003, "binary messages required");
+        assert!(outdated.starts_with("WebSocket закрыт: 1003 binary messages required"));
+        assert!(outdated.contains("worker/tglock-worker.js"));
+        assert_eq!(
+            describe_ws_close(1011, "Telegram socket failed"),
+            "WebSocket закрыт: 1011 Telegram socket failed"
+        );
+    }
 
     /// Start the proxy on a kernel-assigned port.
     ///
