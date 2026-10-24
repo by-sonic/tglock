@@ -34,6 +34,32 @@ const CONNECT_TIMEOUT_MS = 3000;
 const MAX_PENDING_BYTES = 1024 * 1024;
 const MAX_PENDING_MESSAGES = 256;
 
+// Размер бинарного кадра и способ достать его байты; null — текстовый кадр.
+//
+// С compatibility date 2026-03-17 бинарные кадры приходят как Blob, если
+// binaryType не "arraybuffer". Свойство выставлено при accept(); Blob всё
+// равно принимается — на случай рантайма, который его не учитывает. Раньше
+// такой кадр закрывал туннель кодом 1003 сразу после рукопожатия (#61).
+//
+// Каждая ветка проверяет тип напрямую, чтобы проверка типов в редакторе
+// Cloudflare не подчёркивала доступ к полям (by-sonic/tglock#66).
+/** @param {unknown} data */
+function binaryFrame(data) {
+  if (typeof Blob !== "undefined" && data instanceof Blob) {
+    const blob = data;
+    return { size: blob.size, read: async () => new Uint8Array(await blob.arrayBuffer()) };
+  }
+  if (data instanceof ArrayBuffer) {
+    const bytes = new Uint8Array(data);
+    return { size: bytes.byteLength, read: async () => bytes };
+  }
+  if (ArrayBuffer.isView(data)) {
+    const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    return { size: bytes.byteLength, read: async () => bytes };
+  }
+  return null;
+}
+
 export default {
   async fetch(request, env = {}) {
     const url = new URL(request.url);
@@ -114,23 +140,16 @@ export default {
     let pending = Promise.resolve();
     let pendingBytes = 0;
     let pendingMessages = 0;
+    let uploaded = 0;
 
     server.addEventListener("message", (event) => {
       if (closed) return;
-      const data = event.data;
-      // С compatibility date 2026-03-17 бинарные кадры приходят как Blob, если
-      // binaryType не "arraybuffer". Свойство выставлено выше; Blob всё равно
-      // принимается — на случай рантайма, который его не учитывает. Раньше такой
-      // кадр закрывал туннель кодом 1003 сразу после рукопожатия.
-      const blob = typeof Blob !== "undefined" && data instanceof Blob;
-      if (!blob && !(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) {
+      const frame = binaryFrame(event.data);
+      if (!frame) {
         shutdown(1003, "binary messages required");
         return;
       }
-      const chunk = blob ? null : data instanceof ArrayBuffer
-        ? new Uint8Array(data)
-        : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-      const size = blob ? data.size : chunk.byteLength;
+      const size = frame.size;
       if (pendingBytes + size > MAX_PENDING_BYTES || pendingMessages >= MAX_PENDING_MESSAGES) {
         shutdown(1009, "Telegram write queue full");
         return;
@@ -140,9 +159,12 @@ export default {
       pending = pending
         .then(async () => {
           if (closed) return;
-          const bytes = chunk || new Uint8Array(await data.arrayBuffer());
+          const bytes = await frame.read();
           await writer.ready;
-          if (!closed) await writer.write(bytes);
+          if (!closed) {
+            await writer.write(bytes);
+            uploaded += bytes.byteLength;
+          }
         })
         .catch(() => shutdown(1011, "Telegram write failed"))
         .finally(() => {
@@ -157,16 +179,27 @@ export default {
     // Обратное направление: всё, что приходит от Telegram, уходит клиенту.
     (async () => {
       const reader = upstream.readable.getReader();
+      let downloaded = 0;
       try {
         for (;;) {
           const { value, done } = await reader.read();
           if (done) break;
+          downloaded += value.byteLength;
           server.send(value);
         }
       } catch {
         shutdown(1011, "Telegram read failed");
       } finally {
         reader.releaseLock();
+      }
+      // Telegram закрыл TCP, не ответив ни байтом. Раньше это было обычное
+      // закрытие 1000 без причины, и в журнале клиента не было видно, кто и на
+      // каком шаге оборвал туннель (by-sonic/tglock#53). Строка уходит и в
+      // журнал Worker'а в панели Cloudflare.
+      if (!downloaded && !closed) {
+        console.warn(`Telegram ${destination} closed TCP before replying (client sent ${uploaded} bytes)`);
+        shutdown(1011, "Telegram closed before replying");
+        return;
       }
       shutdown();
     })();

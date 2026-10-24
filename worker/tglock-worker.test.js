@@ -20,7 +20,7 @@ async function fixture({ opened = Promise.resolve(), write, timeout = false } = 
   const closed = deferred();
   const writes = [];
   const events = new Map();
-  const state = { connects: 0, accepted: false, socketCloses: 0, sent: [], closes: [] };
+  const state = { connects: 0, accepted: false, socketCloses: 0, sent: [], closes: [], warnings: [] };
   const server = {
     accept() { state.accepted = true; state.binaryTypeOnAccept = this.binaryType; },
     addEventListener(name, callback) { events.set(name, callback); },
@@ -41,7 +41,7 @@ async function fixture({ opened = Promise.resolve(), write, timeout = false } = 
     },
   };
   const context = vm.createContext({
-    URL, Uint8Array, ArrayBuffer, Blob, setTimeout: timeout ? (fn) => setTimeout(fn, 0) : setTimeout, clearTimeout,
+    URL, Uint8Array, ArrayBuffer, Blob, console: { warn: (line) => state.warnings.push(line) }, setTimeout: timeout ? (fn) => setTimeout(fn, 0) : setTimeout, clearTimeout,
     Response: class {
       constructor(body, options) { this.body = body; Object.assign(this, options); }
     },
@@ -206,6 +206,20 @@ test("Telegram bytes reach WebSocket unchanged and EOF closes both directions", 
   assert.deepEqual(f.state.sent, [[0, 255, 128], [1, 2]]);
   assert.equal(f.state.closes[0].code, 1000);
   assert.equal(f.state.socketCloses, 1);
+});
+
+test("Telegram closing TCP before any reply is named, not a silent 1000", async () => {
+  // A tunnel that never carried a byte from Telegram used to end as a plain
+  // 1000 close, which hid where it broke (#53). The reason also reaches the
+  // Worker log in the Cloudflare dashboard.
+  const f = await fixture();
+  await f.fetch();
+  f.message(new Uint8Array([1, 2, 3]).buffer);
+  await tick();
+  f.eof();
+  for (let i = 0; i < 5; i++) await tick();
+  assert.deepEqual(f.state.closes[0], { code: 1011, reason: "Telegram closed before replying" });
+  assert.match(f.state.warnings[0], /149\.154\.167\.51 closed TCP before replying \(client sent 3 bytes\)/);
 });
 
 test("CDN worker keeps the requested DC203 destination", async () => {
