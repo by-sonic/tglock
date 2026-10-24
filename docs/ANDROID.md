@@ -57,8 +57,13 @@ restart, and explicit force-stop/relaunch. It verifies the foreground service an
 performs a real SOCKS5 greeting through ADB port forwarding to the Rust listener.
 If buttons are inaccessible after a bounded wait, CI explicitly reports the
 lifecycle checks as skipped; a launch-only pass is not lifecycle evidence.
-`android-emulator-smoke-evidence` retains the exact result, UI dumps, service
-state and logcat. This does not test automatic low-memory eviction, battery
+`android-emulator-smoke-evidence-attempt-N` (one per run attempt) retains the
+exact result, timed steps, UI dumps, service state, logcat and, on failure, a
+screenshot. The emulator is the AOSP image without Play services; foreign
+system ANR dialogs are answered with Wait and recorded, while a crash, ANR or
+error dialog of TGLock itself fails the job. A tap the WebView dropped (the
+button is unchanged ten seconds later) is repeated at most twice; the service
+and listener effects are then asserted with the same strictness. This does not test automatic low-memory eviction, battery
 behavior, Telegram connectivity, or a physical phone.
 
 Checked-in `gen/android` contains the native source and Gradle wrapper. Tauri's
