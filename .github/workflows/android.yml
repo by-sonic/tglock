@@ -79,7 +79,7 @@ jobs:
     name: Android 15 emulator smoke
     needs: apk
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
@@ -91,20 +91,25 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      # The AOSP image has no Play services or Pixel Launcher. Their post-boot
+      # work starved system_server on the 4-vCPU runner and produced foreign ANR
+      # dialogs over the app. The app needs neither; WebView is still present.
       - name: Launch and exercise the native app
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
           arch: x86_64
-          target: google_apis
+          target: default
           profile: pixel_2
+          cores: 4
+          ram-size: 4096M
           disable-animations: true
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          script: timeout 180 python3 scripts/android_smoke.py emulator-apk
+          emulator-options: -no-window -no-snapshot -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: timeout 420 python3 scripts/android_smoke.py emulator-apk
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: android-emulator-smoke-evidence
+          name: android-emulator-smoke-evidence-attempt-${{ github.run_attempt }}
           path: android-smoke-evidence/
           if-no-files-found: warn
           retention-days: 14
