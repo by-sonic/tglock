@@ -8,12 +8,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
+// `default`: a settings file written before a field existed must keep the
+// values it has. Without it the whole file failed to parse and silently fell
+// back to defaults, dropping the user's Worker domain with it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 struct Settings {
     lan_mode: bool,
     port: u16,
     worker_domain: String,
+    /// Свой домен на Cloudflare для CF-прокси (docs/CF_PROXY.md).
+    cf_proxy_domain: String,
 }
 
 impl Default for Settings {
@@ -22,6 +27,7 @@ impl Default for Settings {
             lan_mode: false,
             port: proxy::DEFAULT_PORT,
             worker_domain: String::new(),
+            cf_proxy_domain: String::new(),
         }
     }
 }
@@ -232,6 +238,7 @@ async fn start_proxy(
     // A rejected foreground-service start must not leave a hidden proxy running.
     set_foreground_service(&app, true)?;
     state.stats.set_worker_domain(&settings.worker_domain);
+    state.stats.set_cf_proxy_domain(&settings.cf_proxy_domain);
     *state.active_port.lock().unwrap() = settings.port;
     *state.active_listen.lock().unwrap() = Some(listen);
     *state.started_at.lock().unwrap() = Some(Instant::now());
@@ -442,6 +449,17 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_settings_file_from_an_older_version_keeps_its_values() {
+        let old: Settings =
+            serde_json::from_str(r#"{"lanMode":true,"port":1443,"workerDomain":"a.workers.dev"}"#)
+                .unwrap();
+        assert!(old.lan_mode);
+        assert_eq!(old.port, 1443);
+        assert_eq!(old.worker_domain, "a.workers.dev");
+        assert_eq!(old.cf_proxy_domain, "");
+    }
 
     #[test]
     fn nothing_to_share_when_the_proxy_is_off_or_local() {

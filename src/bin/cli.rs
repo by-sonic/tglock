@@ -55,6 +55,11 @@ struct Args {
     #[arg(long, value_name = "DOMAIN")]
     worker: Vec<String>,
 
+    /// Свой домен на Cloudflare для CF-прокси (записи kws1…kws5, kws203 на
+    /// адреса Telegram, docs/CF_PROXY.md). Можно повторять
+    #[arg(long, value_name = "DOMAIN")]
+    cf_proxy: Vec<String>,
+
     /// Проксировать и не-Telegram адреса. На сетевом адресе это открытый SOCKS5
     #[arg(long)]
     allow_direct: bool,
@@ -77,6 +82,7 @@ impl Args {
             lan: self.lan,
             allow_direct: self.allow_direct,
             worker: self.worker.clone(),
+            cf_proxy: self.cf_proxy.clone(),
             secret_file: self.secret_file.clone(),
             quiet: self.quiet,
         }
@@ -167,6 +173,9 @@ async fn serve(args: Args) -> Result<(), String> {
         }
         if !settings.workers.is_empty() {
             say(&format!("Резервные Worker-домены: {}", settings.workers));
+        }
+        if !settings.cf_proxies.is_empty() {
+            say(&format!("CF-прокси домены: {}", settings.cf_proxies));
         }
     }
 
@@ -336,6 +345,13 @@ mod tests {
     fn repeated_worker_flags_collapse_into_one_list() {
         let settings = from_flags(&["--worker", "a.workers.dev", "--worker", "b.workers.dev"]);
         assert_eq!(settings.workers, "a.workers.dev,b.workers.dev");
+    }
+
+    #[test]
+    fn repeated_cf_proxy_flags_collapse_into_one_list() {
+        let settings = from_flags(&["--cf-proxy", "a.example", "--cf-proxy", "b.example"]);
+        assert_eq!(settings.cf_proxies, "a.example,b.example");
+        assert!(from_flags(&[]).cf_proxies.is_empty());
     }
 
     #[test]

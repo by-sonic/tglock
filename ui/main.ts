@@ -34,6 +34,7 @@ type Settings = {
   lanMode: boolean;
   port: number;
   workerDomain: string;
+  cfProxyDomain: string;
 };
 
 const root = document.querySelector<HTMLDivElement>("#app")!;
@@ -55,7 +56,7 @@ let status: Status = {
   shareAddress: null,
   logs: [],
 };
-let settings: Settings = { lanMode: false, port: 1080, workerDomain: "" };
+let settings: Settings = { lanMode: false, port: 1080, workerDomain: "", cfProxyDomain: "" };
 let busy = false;
 let toastTimer: number | undefined;
 let toastMessage = "";
@@ -232,6 +233,20 @@ function renderSettings(): void {
           <p class="field-hint">Необязательно. Используется как резервный маршрут.</p>
         </div>
 
+        <div class="setting-card">
+          <label class="field-label" for="cf-proxy">Свой домен на Cloudflare</label>
+          <input
+            id="cf-proxy"
+            name="cf-proxy"
+            type="text"
+            value="${escapeHtml(settings.cfProxyDomain)}"
+            placeholder="example.com"
+            autocomplete="off"
+            ${status.running ? "disabled" : ""}
+          />
+          <p class="field-hint">Необязательно. CF-прокси без Worker: записи kws1…kws5 и kws203 на адреса Telegram.</p>
+        </div>
+
         <div class="setting-list">
           <label class="setting-row" for="lan-mode">
             <span>
@@ -403,9 +418,10 @@ async function saveSettings(event: Event): Promise<void> {
   event.preventDefault();
   if (busy || status.running) return;
   const worker = document.querySelector<HTMLInputElement>("#worker");
+  const cfProxy = document.querySelector<HTMLInputElement>("#cf-proxy");
   const lanMode = document.querySelector<HTMLInputElement>("#lan-mode");
   const port = document.querySelector<HTMLInputElement>("#port");
-  if (!worker || !lanMode || !port) return;
+  if (!worker || !cfProxy || !lanMode || !port) return;
 
   const parsedPort = Number(port.value);
   if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
@@ -416,6 +432,7 @@ async function saveSettings(event: Event): Promise<void> {
   busy = true;
   settings = {
     workerDomain: worker.value.trim(),
+    cfProxyDomain: cfProxy.value.trim(),
     lanMode: lanMode.checked,
     port: parsedPort,
   };
@@ -451,7 +468,7 @@ async function copyDiagnostics(): Promise<void> {
     // Public reports exclude proxy links, worker domains and free-form logs.
     const report = {
       application: "TGLock",
-      version: "2.0.0-beta.16",
+      version: "2.0.0-beta.17",
       running: status.running,
       activeConnections: status.activeConnections,
       tunnels: status.tunnels,

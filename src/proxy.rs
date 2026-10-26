@@ -269,6 +269,26 @@ impl Stats {
         }
     }
 
+    /// Свои домены на Cloudflare для CF-прокси (`kwsN.<домен>`, docs/CF_PROXY.md).
+    pub fn set_cf_proxy_domain(&self, domain: &str) {
+        let domains = domain
+            .split([',', ';', ' '])
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let result = self.transport.set_cf_proxy_domains(&domains);
+        for rejected in &result.rejected {
+            self.note(format!(
+                "CF-прокси «{rejected}» не похож на имя домена — маршрут не добавлен.                  Нужен только домен, без https:// и без kws: example.com"
+            ));
+        }
+        for accepted in &result.accepted {
+            self.note(format!(
+                "CF-прокси в списке маршрутов: kws1.{accepted} … kws5.{accepted}, kws203.{accepted}"
+            ));
+        }
+    }
+
     pub fn stop(&self) {
         if let Some(sender) = self.shutdown.lock().unwrap().take() {
             let _ = sender.send(true);
@@ -919,7 +939,7 @@ async fn cdn_tcp_tunnel(
                         stats,
                         connected,
                         dc,
-                        "CDN TCP закрыт без ответа Telegram",
+                        "MTProto TCP закрыт без ответа Telegram",
                     ))
                 };
             }
@@ -1745,7 +1765,7 @@ mod tests {
         assert!(stats
             .drain_events()
             .iter()
-            .any(|event| event.contains("CDN TCP закрыт без ответа")));
+            .any(|event| event.contains("MTProto TCP закрыт без ответа")));
         relay.await.unwrap();
         stats.stop();
         server.await.unwrap().unwrap();

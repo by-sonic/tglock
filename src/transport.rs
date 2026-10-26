@@ -33,6 +33,10 @@ pub enum RouteKind {
     SystemDns,
     CloudflareWorker,
     TelegramTcp,
+    /// Свой домен на Cloudflare: записи `kwsN` указывают на адреса Telegram,
+    /// и Cloudflare сам доводит WebSocket до дата-центра. Worker и его лимиты
+    /// не нужны — так работает CF-прокси в Flowseal/tg-ws-proxy.
+    CloudflareProxy,
 }
 
 impl RouteKind {
@@ -43,6 +47,7 @@ impl RouteKind {
             Self::SystemDns => 3,
             Self::CloudflareWorker => 4,
             Self::TelegramTcp => 5,
+            Self::CloudflareProxy => 6,
         }
     }
 
@@ -53,6 +58,7 @@ impl RouteKind {
             3 => Some(Self::SystemDns),
             4 => Some(Self::CloudflareWorker),
             5 => Some(Self::TelegramTcp),
+            6 => Some(Self::CloudflareProxy),
             _ => None,
         }
     }
@@ -64,7 +70,8 @@ impl RouteKind {
             Self::AlternateTelegramIp => "Запасной Telegram IP",
             Self::SystemDns => "Системный DNS",
             Self::CloudflareWorker => "Cloudflare Worker",
-            Self::TelegramTcp => "Telegram CDN TCP",
+            Self::TelegramTcp => "Telegram TCP (MTProto)",
+            Self::CloudflareProxy => "Cloudflare-прокси",
         }
     }
 }
@@ -91,8 +98,13 @@ pub struct Route {
 
 impl Route {
     fn cdn_tcp() -> Self {
+        Self::telegram_tcp(CDN203_IP)
+    }
+
+    /// Native obfuscated2 straight to a pinned Telegram address.
+    fn telegram_tcp(ip: &str) -> Self {
         Self {
-            connect_host: CDN203_IP.to_owned(),
+            connect_host: ip.to_owned(),
             websocket_host: String::new(),
             path: String::new(),
             kind: RouteKind::TelegramTcp,
@@ -150,6 +162,7 @@ struct HealthState {
 pub struct TransportEngine {
     health: Mutex<HealthState>,
     worker_domains: Mutex<Vec<String>>,
+    cf_proxy_domains: Mutex<Vec<String>>,
     /// Сколько раз отдельный маршрут не ответил.
     ///
     /// Считается отдельно от `Stats::ws_failures`, который растёт только когда
@@ -194,22 +207,16 @@ impl TransportEngine {
     /// проверку, маршрут не появлялся, и «воркер настроен» ничем не отличалось
     /// от «воркера нет» (by-sonic/tglock#50).
     pub fn set_worker_domains(&self, domains: &[String]) -> WorkerDomains {
-        let mut accepted = Vec::new();
-        let mut rejected = Vec::new();
-        for domain in domains {
-            let trimmed = domain.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let normalized = trimmed.to_ascii_lowercase();
-            if !valid_domain(&normalized) {
-                rejected.push(trimmed.to_owned());
-            } else if !accepted.contains(&normalized) {
-                accepted.push(normalized);
-            }
-        }
-        *self.worker_domains.lock().unwrap() = accepted.clone();
-        WorkerDomains { accepted, rejected }
+        let result = split_domains(domains);
+        *self.worker_domains.lock().unwrap() = result.accepted.clone();
+        result
+    }
+
+    /// Задать свои домены на Cloudflare для CF-прокси (`kwsN.<домен>`).
+    pub fn set_cf_proxy_domains(&self, domains: &[String]) -> WorkerDomains {
+        let result = split_domains(domains);
+        *self.cf_proxy_domains.lock().unwrap() = result.accepted.clone();
+        result
     }
 
     pub async fn connect(
@@ -235,47 +242,21 @@ impl TransportEngine {
         F: FnMut(Route) -> Fut,
         Fut: std::future::Future<Output = Result<T, String>>,
     {
-        let mut candidates = self.ordered_candidates(key).into_iter().peekable();
-        let mut pending = FuturesUnordered::new();
-        let mut next_start = Instant::now();
+        // Native TCP to an ordinary DC opens the moment the address is
+        // reachable, long before Telegram answers, so racing it would beat
+        // every slower working WebSocket. Like the TCP fallback in
+        // Flowseal/tg-ws-proxy it is tried only once every other route failed.
+        let (main, last_resort): (Vec<_>, Vec<_>) = self
+            .ordered_candidates(key)
+            .into_iter()
+            .partition(|route| !is_last_resort(route));
         let mut errors = Vec::new();
-
-        while candidates.peek().is_some() || !pending.is_empty() {
-            if candidates.peek().is_some()
-                && pending.len() < MAX_CONNECTING
-                && (pending.is_empty() || Instant::now() >= next_start)
+        for candidates in [main, last_resort] {
+            if let Some(winner) = self
+                .race_candidates(key, candidates, &mut connect, &mut errors)
+                .await
             {
-                let route = candidates.next().unwrap();
-                // Another client may have failed this route since we took our
-                // snapshot. Never knowingly bypass its current cooldown.
-                if !self.route_available(&route) {
-                    continue;
-                }
-                let connection = connect(route.clone());
-                pending.push(async move { (route, connection.await) });
-                next_start = Instant::now() + FALLBACK_DELAY;
-                continue;
-            }
-            tokio::select! {
-                Some((route, result)) = pending.next(), if !pending.is_empty() => {
-                    match result {
-                        Ok(connection) => {
-                            self.record_success(key, &route);
-                            return Ok((connection, ConnectedRoute { route }));
-                        }
-                        Err(error) => {
-                            self.record_failure(&route);
-                            let endpoint = if route.kind == RouteKind::TelegramTcp {
-                                format!("{}:{} (MTProto TCP)", route.connect_host, route.port)
-                            } else {
-                                format!("{} (TLS {})", route.connect_host, route.websocket_host)
-                            };
-                            errors.push(format!("{endpoint} — {error}"));
-                        }
-                    }
-                }
-                _ = tokio::time::sleep_until(next_start),
-                    if candidates.peek().is_some() && pending.len() < MAX_CONNECTING => {}
+                return Ok(winner);
             }
         }
 
@@ -303,6 +284,64 @@ impl TransportEngine {
             if key.media { " (медиа)" } else { "" },
             errors.join("; ")
         ))
+    }
+
+    /// Race one tier of candidates; failures are appended to `errors`.
+    async fn race_candidates<T, F, Fut>(
+        &self,
+        key: DcKey,
+        candidates: Vec<Route>,
+        connect: &mut F,
+        errors: &mut Vec<String>,
+    ) -> Option<(T, ConnectedRoute)>
+    where
+        F: FnMut(Route) -> Fut,
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
+        let mut candidates = candidates.into_iter().peekable();
+        let mut pending = FuturesUnordered::new();
+        let mut next_start = Instant::now();
+
+        while candidates.peek().is_some() || !pending.is_empty() {
+            if candidates.peek().is_some()
+                && pending.len() < MAX_CONNECTING
+                && (pending.is_empty() || Instant::now() >= next_start)
+            {
+                let route = candidates.next().unwrap();
+                // Another client may have failed this route since we took our
+                // snapshot. Never knowingly bypass its current cooldown.
+                if !self.route_available(&route) {
+                    continue;
+                }
+                let connection = connect(route.clone());
+                pending.push(async move { (route, connection.await) });
+                next_start = Instant::now() + FALLBACK_DELAY;
+                continue;
+            }
+            tokio::select! {
+                Some((route, result)) = pending.next(), if !pending.is_empty() => {
+                    match result {
+                        Ok(connection) => {
+                            self.record_success(key, &route);
+                            return Some((connection, ConnectedRoute { route }));
+                        }
+                        Err(error) => {
+                            self.record_failure(&route);
+                            let endpoint = if route.kind == RouteKind::TelegramTcp {
+                                format!("{}:{} (MTProto TCP)", route.connect_host, route.port)
+                            } else {
+                                format!("{} (TLS {})", route.connect_host, route.websocket_host)
+                            };
+                            errors.push(format!("{endpoint} — {error}"));
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(next_start),
+                    if candidates.peek().is_some() && pending.len() < MAX_CONNECTING => {}
+            }
+        
+        }
+        None
     }
 
     fn route_available(&self, route: &Route) -> bool {
@@ -333,14 +372,16 @@ impl TransportEngine {
         candidates.sort_by_key(|route| {
             let preferred_rank = u8::from(preferred != Some(route));
             let kind_rank = match route.kind {
-                RouteKind::TelegramTcp => 0,
+                RouteKind::TelegramTcp if route.connect_host == CDN203_IP => 0,
                 RouteKind::TelegramIp if Some(route) == all_routes.first() => 0,
-                // The operator explicitly configured this independent path.
-                // Start it after the primary IP, before more potentially
+                // The operator explicitly configured these independent paths.
+                // Start them after the primary IP, before more potentially
                 // blocked Telegram addresses consume the concurrency budget.
-                RouteKind::CloudflareWorker => 1,
+                RouteKind::CloudflareWorker | RouteKind::CloudflareProxy => 1,
                 RouteKind::TelegramIp | RouteKind::AlternateTelegramIp => 2,
                 RouteKind::SystemDns => 3,
+                // Last resort, raced separately; see race_connections().
+                RouteKind::TelegramTcp => 4,
             };
             (preferred_rank, kind_rank)
         });
@@ -358,6 +399,15 @@ impl TransportEngine {
         }
 
         let mut routes = routes_for_dc(key.dc, key.media);
+        for domain in self.cf_proxy_domains.lock().unwrap().iter() {
+            let host = cf_proxy_host(key.dc, domain);
+            routes.push(Route::https(
+                host.clone(),
+                host,
+                "/apiws".to_owned(),
+                RouteKind::CloudflareProxy,
+            ));
+        }
         let Some(path) = worker_path(key.dc) else {
             return routes;
         };
@@ -421,6 +471,19 @@ impl TransportEngine {
 pub(crate) fn worker_path(dc: u16) -> Option<String> {
     let destination = telegram_ips(dc).first()?;
     Some(format!("/apiws?dst={}&dc={}", destination, dc))
+}
+
+/// Host of a CF-proxy domain for a data centre: `kws<dc>.<domain>`, with DNS
+/// records the operator points at the Telegram addresses (docs/CF_PROXY.md).
+/// CDN203 keeps its own record; it must never be folded into DC2.
+pub(crate) fn cf_proxy_host(dc: u16, domain: &str) -> String {
+    format!("kws{}.{}", dc, domain)
+}
+
+/// Native TCP to an ordinary data centre — every pinned address except the
+/// CDN, whose native transport is its primary route.
+fn is_last_resort(route: &Route) -> bool {
+    route.kind == RouteKind::TelegramTcp && route.connect_host != CDN203_IP
 }
 
 /// Every address a Worker may be asked to reach, so a deployment can refuse
@@ -502,6 +565,16 @@ pub fn routes_for_dc(dc: u16, media: bool) -> Vec<Route> {
             ));
         }
     }
+    // Where the WebSocket frontends are filtered but the address itself is
+    // reachable, plain MTProto to the DC's primary address still works —
+    // measured from a Russian ISP where TLS to .51/.91/.50/.100/.5 was cut
+    // while native TCP to each of them answered req_pq (main and media).
+    // 149.154.167.220 is a WebSocket frontend only and does not speak native
+    // MTProto, so it gets no TCP route. Raced only after everything above
+    // failed (race_connections).
+    if dc != 203 {
+        routes.push(Route::telegram_tcp(ips[0]));
+    }
     routes
 }
 
@@ -539,7 +612,7 @@ async fn connect_route_with_config(
     // Native TCP is a narrowly scoped CDN route, not a general proxy escape
     // hatch. Reject malformed raw routes before dialing anything.
     if route.kind == RouteKind::TelegramTcp && !allowed_tcp_route(route) {
-        return Err("native MTProto TCP разрешён только для закреплённого CDN203".to_owned());
+        return Err("native MTProto TCP разрешён только до закреплённых адресов Telegram".to_owned());
     }
     let tcp = tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -601,11 +674,30 @@ fn allowed_tcp_route(route: &Route) -> bool {
     if route.connect_host == "127.0.0.1" && !route.secure {
         return true;
     }
-    route.connect_host == CDN203_IP
+    worker_allowed_destinations().contains(&route.connect_host.as_str())
         && route.port == HTTPS_PORT
         && route.websocket_host.is_empty()
         && route.path.is_empty()
         && !route.secure
+}
+
+/// Нормализовать список доменов, отделив непохожие на имя хоста.
+fn split_domains(domains: &[String]) -> WorkerDomains {
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for domain in domains {
+        let trimmed = domain.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = trimmed.to_ascii_lowercase();
+        if !valid_domain(&normalized) {
+            rejected.push(trimmed.to_owned());
+        } else if !accepted.contains(&normalized) {
+            accepted.push(normalized);
+        }
+    }
+    WorkerDomains { accepted, rejected }
 }
 
 fn valid_domain(domain: &str) -> bool {
@@ -714,9 +806,10 @@ mod tests {
     }
 
     #[test]
-    fn production_websockets_use_tls_and_native_tcp_is_restricted_to_cdn203() {
+    fn production_websockets_use_tls_and_native_tcp_only_reaches_pinned_telegram_ips() {
         let engine = TransportEngine::new();
         engine.set_worker_domains(&["fallback.workers.dev".to_owned()]);
+        engine.set_cf_proxy_domains(&["example.com".to_owned()]);
         for dc in [1, 2, 3, 4, 5, 203] {
             for media in [false, true] {
                 let routes = engine.routes_for_key(DcKey { dc, media });
@@ -724,14 +817,97 @@ mod tests {
                 for route in routes {
                     assert_eq!(route.port, 443, "{route:?}");
                     if route.kind == RouteKind::TelegramTcp {
-                        assert_eq!(dc, 203);
-                        assert_eq!(route.connect_host, CDN203_IP);
+                        assert!(telegram_ips(dc).contains(&route.connect_host.as_str()), "{route:?}");
                         assert!(allowed_tcp_route(&route));
                     } else {
                         assert!(route.secure, "{route:?}");
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn native_tcp_to_an_ordinary_dc_is_a_last_resort_but_cdn203_leads() {
+        let engine = TransportEngine::new();
+        engine.set_cf_proxy_domains(&["example.com".to_owned()]);
+        for dc in [1, 2, 3, 4, 5] {
+            let ordered = engine.ordered_candidates(DcKey { dc, media: true });
+            let first_tcp = ordered
+                .iter()
+                .position(|route| route.kind == RouteKind::TelegramTcp)
+                .expect("every DC has a native TCP fallback");
+            assert!(ordered[first_tcp..].iter().all(is_last_resort), "DC{dc}: {ordered:?}");
+            assert!(ordered[..first_tcp].iter().all(|route| !is_last_resort(route)));
+        }
+        let cdn = engine.ordered_candidates(DcKey { dc: 203, media: true });
+        assert_eq!(cdn[0], Route::cdn_tcp());
+        assert!(!is_last_resort(&cdn[0]));
+    }
+
+    #[tokio::test]
+    async fn native_tcp_is_dialed_only_after_every_other_route_failed() {
+        use std::sync::Mutex as StdMutex;
+        let key = DcKey { dc: 2, media: true };
+
+        // A slow but working WebSocket wins; TCP is never dialed.
+        let engine = TransportEngine::new();
+        let dialed = Arc::new(StdMutex::new(Vec::new()));
+        let log = dialed.clone();
+        let (_, connected) = engine
+            .race_connections(key, move |route: Route| {
+                log.lock().unwrap().push(route.kind);
+                async move {
+                    if route.kind == RouteKind::TelegramIp {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok(())
+                    } else if route.kind == RouteKind::TelegramTcp {
+                        Ok(())
+                    } else {
+                        Err("blocked".to_owned())
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(connected.route.kind, RouteKind::TelegramIp);
+        assert!(!dialed.lock().unwrap().contains(&RouteKind::TelegramTcp));
+
+        // Every WebSocket fails: the pinned TCP route carries the tunnel.
+        let engine = TransportEngine::new();
+        let (_, connected) = engine
+            .race_connections(key, |route: Route| async move {
+                if route.kind == RouteKind::TelegramTcp {
+                    Ok(())
+                } else {
+                    Err("blocked".to_owned())
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(connected.route.kind, RouteKind::TelegramTcp);
+        assert!(telegram_ips(2).contains(&connected.route.connect_host.as_str()));
+    }
+
+    #[test]
+    fn cf_proxy_domains_become_kws_routes_and_keep_cdn203_separate() {
+        let engine = TransportEngine::new();
+        let result = engine.set_cf_proxy_domains(&[
+            " Example.COM ".to_owned(),
+            "https://bad.example/".to_owned(),
+        ]);
+        assert_eq!(result.accepted, ["example.com"]);
+        assert_eq!(result.rejected, ["https://bad.example/"]);
+        for (dc, host) in [(2, "kws2.example.com"), (203, "kws203.example.com")] {
+            let routes = engine.routes_for_key(DcKey { dc, media: true });
+            let proxy = routes
+                .iter()
+                .find(|route| route.kind == RouteKind::CloudflareProxy)
+                .expect("CF proxy route");
+            assert_eq!(proxy.connect_host, host);
+            assert_eq!(proxy.websocket_host, host);
+            assert_eq!(proxy.path, "/apiws");
+            assert!(proxy.secure);
         }
     }
 
@@ -1270,11 +1446,13 @@ mod tests {
         let mut route = Route::cdn_tcp();
         route.connect_host = "127.0.0.2".to_owned();
         let error = connect_route(&route).await.unwrap_err();
-        assert!(error.contains("только для закреплённого CDN203"), "{error}");
-        for dc in [1, 2, 3, 4, 5, 999] {
+        assert!(error.contains("только до закреплённых адресов Telegram"), "{error}");
+        assert!(routes_for_dc(999, false).is_empty());
+        for dc in [1, 2, 3, 4, 5] {
             assert!(routes_for_dc(dc, false)
                 .iter()
-                .all(|route| route.kind != RouteKind::TelegramTcp));
+                .filter(|route| route.kind == RouteKind::TelegramTcp)
+                .all(|route| route.connect_host == telegram_ips(dc)[0]));
         }
     }
 
