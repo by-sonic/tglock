@@ -1,6 +1,6 @@
 [package]
 name = "tglock"
-version = "2.0.0-beta.17"
+version = "2.0.0-beta.18"
 edition = "2021"
 rust-version = "1.88"
 description = "Telegram unblock via local WebSocket tunnel"
@@ -38,7 +38,7 @@ path = "src/bin/cli.rs"
 required-features = ["cli"]
 
 [dependencies]
-tauri = { version = "2", features = [], optional = true }
+tauri = { version = "2", features = ["tray-icon"], optional = true }
 tauri-plugin-opener = { version = "2", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 # Файл конфигурации CLI. TOML, а не JSON, потому что файл правят руками и в нём

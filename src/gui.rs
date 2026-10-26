@@ -431,7 +431,18 @@ pub fn run() {
                 );
             }
             app.manage(state);
+            #[cfg(desktop)]
+            if let Err(error) = setup_tray(app) {
+                app.state::<AppState>().log(
+                    format!("Значок в трее недоступен ({error}). Закрытие окна выключит защиту"),
+                    true,
+                );
+            }
             Ok(())
+        })
+        .on_window_event(|_window, _event| {
+            #[cfg(desktop)]
+            hide_to_tray_on_close(_window, _event);
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -442,8 +453,101 @@ pub fn run() {
             get_telegram_link,
             open_telegram
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run TGLock");
+        .build(tauri::generate_context!())
+        .expect("failed to build TGLock")
+        .run(|_app, _event| {
+            // В macOS окно, спрятанное в трей, возвращает и клик по значку в Dock.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = _event {
+                show_main_window(_app);
+            }
+        });
+}
+
+#[cfg(desktop)]
+const TRAY_ID: &str = "main";
+
+/// Закрытие окна при включённой защите прячет его в трей, и прокси продолжает
+/// работать, как в tg-ws-proxy. Выйти можно из меню трея (by-sonic/tglock#70).
+/// Если защита выключена или значка в трее нет, окно закрывается как раньше:
+/// иначе приложение осталось бы работать без способа до него добраться.
+#[cfg(desktop)]
+fn hide_to_tray_on_close(window: &tauri::Window, event: &tauri::WindowEvent) {
+    let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+        return;
+    };
+    let app = window.app_handle();
+    let running = app.state::<AppState>().stats.running.load(Ordering::SeqCst);
+    if running && app.tray_by_id(TRAY_ID).is_some() {
+        api.prevent_close();
+        let _ = window.hide();
+    }
+}
+
+#[cfg(desktop)]
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(desktop)]
+fn setup_tray(app: &tauri::App) -> Result<(), String> {
+    // В Linux значок держится на libayatana-appindicator, и без неё tray-icon
+    // паникует, а не возвращает ошибку. Без трея окно просто закрывается.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_tray(app)))
+        .map_err(|_| "нет libayatana-appindicator3".to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(desktop)]
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let show = MenuItem::with_id(app, "show", "Открыть TGLock", true, None::<&str>)?;
+    let telegram = MenuItem::with_id(app, "telegram", "Открыть Telegram", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &telegram, &separator, &quit])?;
+
+    let mut tray = TrayIconBuilder::with_id(TRAY_ID)
+        .tooltip("TGLock")
+        .menu(&menu)
+        // В Windows и Linux левый клик открывает окно, меню — по правому.
+        // В macOS меню по клику привычнее.
+        .show_menu_on_left_click(cfg!(target_os = "macos"))
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "telegram" => {
+                let state = app.state::<AppState>();
+                if let Err(error) = open_telegram_link(app, &state) {
+                    state.log(error, true);
+                }
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if cfg!(target_os = "macos") {
+                return;
+            }
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
 }
 
 #[cfg(test)]
