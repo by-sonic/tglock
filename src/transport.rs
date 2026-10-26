@@ -339,7 +339,6 @@ impl TransportEngine {
                 _ = tokio::time::sleep_until(next_start),
                     if candidates.peek().is_some() && pending.len() < MAX_CONNECTING => {}
             }
-        
         }
         None
     }
@@ -612,7 +611,9 @@ async fn connect_route_with_config(
     // Native TCP is a narrowly scoped CDN route, not a general proxy escape
     // hatch. Reject malformed raw routes before dialing anything.
     if route.kind == RouteKind::TelegramTcp && !allowed_tcp_route(route) {
-        return Err("native MTProto TCP разрешён только до закреплённых адресов Telegram".to_owned());
+        return Err(
+            "native MTProto TCP разрешён только до закреплённых адресов Telegram".to_owned(),
+        );
     }
     let tcp = tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -817,7 +818,10 @@ mod tests {
                 for route in routes {
                     assert_eq!(route.port, 443, "{route:?}");
                     if route.kind == RouteKind::TelegramTcp {
-                        assert!(telegram_ips(dc).contains(&route.connect_host.as_str()), "{route:?}");
+                        assert!(
+                            telegram_ips(dc).contains(&route.connect_host.as_str()),
+                            "{route:?}"
+                        );
                         assert!(allowed_tcp_route(&route));
                     } else {
                         assert!(route.secure, "{route:?}");
@@ -837,10 +841,18 @@ mod tests {
                 .iter()
                 .position(|route| route.kind == RouteKind::TelegramTcp)
                 .expect("every DC has a native TCP fallback");
-            assert!(ordered[first_tcp..].iter().all(is_last_resort), "DC{dc}: {ordered:?}");
-            assert!(ordered[..first_tcp].iter().all(|route| !is_last_resort(route)));
+            assert!(
+                ordered[first_tcp..].iter().all(is_last_resort),
+                "DC{dc}: {ordered:?}"
+            );
+            assert!(ordered[..first_tcp]
+                .iter()
+                .all(|route| !is_last_resort(route)));
         }
-        let cdn = engine.ordered_candidates(DcKey { dc: 203, media: true });
+        let cdn = engine.ordered_candidates(DcKey {
+            dc: 203,
+            media: true,
+        });
         assert_eq!(cdn[0], Route::cdn_tcp());
         assert!(!is_last_resort(&cdn[0]));
     }
@@ -1446,7 +1458,10 @@ mod tests {
         let mut route = Route::cdn_tcp();
         route.connect_host = "127.0.0.2".to_owned();
         let error = connect_route(&route).await.unwrap_err();
-        assert!(error.contains("только до закреплённых адресов Telegram"), "{error}");
+        assert!(
+            error.contains("только до закреплённых адресов Telegram"),
+            "{error}"
+        );
         assert!(routes_for_dc(999, false).is_empty());
         for dc in [1, 2, 3, 4, 5] {
             assert!(routes_for_dc(dc, false)
