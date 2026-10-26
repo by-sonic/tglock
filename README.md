@@ -1,3 +1,10 @@
+<!-- SUPPORT-START -->
+<p align="center">
+  <b>💛 Поддержать проект</b> · <b>USDT</b> (Tether) в сети <b>TRC20</b>:<br/>
+  <code>TEHHyPSeZ7t5vfVJmjtEBkqJdpfcrm1wqg</code>
+</p>
+<!-- SUPPORT-END -->
+
 <!-- ════════════════════════ ROSEVPN — sponsor ════════════════════════ -->
 
 <p align="center">
