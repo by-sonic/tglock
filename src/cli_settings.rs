@@ -33,6 +33,8 @@ pub struct FileConfig {
     pub lan: Option<bool>,
     pub allow_direct: Option<bool>,
     pub worker: Option<Vec<String>>,
+    /// Свои домены на Cloudflare для CF-прокси (docs/CF_PROXY.md).
+    pub cf_proxy: Option<Vec<String>>,
     pub secret: Option<String>,
     pub secret_file: Option<PathBuf>,
     pub quiet: Option<bool>,
@@ -58,6 +60,7 @@ pub struct Overrides {
     pub lan: bool,
     pub allow_direct: bool,
     pub worker: Vec<String>,
+    pub cf_proxy: Vec<String>,
     pub secret_file: Option<PathBuf>,
     pub quiet: bool,
 }
@@ -79,6 +82,8 @@ pub struct Resolved {
     pub listen: ListenConfig,
     /// Домены Worker'ов в том виде, в каком их ждёт `Stats::set_worker_domain`.
     pub workers: String,
+    /// Домены CF-прокси в том виде, в каком их ждёт `Stats::set_cf_proxy_domain`.
+    pub cf_proxies: String,
     pub secret: SecretSource,
     pub quiet: bool,
 }
@@ -93,6 +98,7 @@ impl Resolved {
             SecretSource::Ephemeral => proxy::Stats::new(),
         };
         stats.set_worker_domain(&self.workers);
+        stats.set_cf_proxy_domain(&self.cf_proxies);
         stats
     }
 }
@@ -127,6 +133,11 @@ pub fn resolve(file: FileConfig, cli: Overrides) -> Result<Resolved, String> {
     } else {
         cli.worker
     };
+    let cf_proxies = if cli.cf_proxy.is_empty() {
+        file.cf_proxy.unwrap_or_default()
+    } else {
+        cli.cf_proxy
+    };
 
     // Секрет из файла конфигурации важнее отдельного файла: если человек вписал
     // его сюда, значит хотел держать всё в одном месте.
@@ -142,6 +153,7 @@ pub fn resolve(file: FileConfig, cli: Overrides) -> Result<Resolved, String> {
     Ok(Resolved {
         listen,
         workers: workers.join(","),
+        cf_proxies: cf_proxies.join(","),
         secret,
         quiet: cli.quiet || file.quiet.unwrap_or(false),
     })
@@ -185,6 +197,7 @@ mod tests {
             port = 1443
             allow_direct = true
             worker = ["a.workers.dev", "b.workers.dev"]
+            cf_proxy = ["example.com"]
             quiet = true
         "#,
         )
@@ -193,6 +206,7 @@ mod tests {
         assert_eq!(resolved.listen.addr.to_string(), "10.0.0.5:1443");
         assert!(resolved.listen.allow_direct);
         assert_eq!(resolved.workers, "a.workers.dev,b.workers.dev");
+        assert_eq!(resolved.cf_proxies, "example.com");
         assert!(resolved.quiet);
     }
 

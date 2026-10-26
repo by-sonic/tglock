@@ -33,6 +33,10 @@
 # docs/CLOUDFLARE_WORKER.md
 # worker = ["my-name.workers.dev"]
 
+# Свой домен на Cloudflare (CF-прокси): записи kws1…kws5 и kws203 указывают
+# на адреса Telegram, Worker не нужен. Настройка описана в docs/CF_PROXY.md
+# cf_proxy = ["example.com"]
+
 # Пропускать и не-Telegram адреса.
 # На loopback это включено само. На сетевом адресе означает открытый
 # SOCKS5-прокси для всего интернета — включайте осознанно.
