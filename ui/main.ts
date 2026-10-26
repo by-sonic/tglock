@@ -113,6 +113,47 @@ function connectionState(): { title: string; subtitle: string; className: string
   };
 }
 
+// Статус приходит раз в секунду. Если каждый раз переписывать root.innerHTML,
+// кнопки становятся новыми узлами, и тап, начатый на старой кнопке и
+// законченный на новой, Chromium не превращает в click. Поэтому разметка
+// накладывается на уже существующие узлы: меняются только текст и атрибуты,
+// а элемент заменяется лишь там, где на его месте теперь другой тег или id.
+function patchRoot(html: string): void {
+  const next = document.createElement("template");
+  next.innerHTML = html;
+  patchChildren(root, next.content);
+}
+
+function patchChildren(current: Node, next: Node): void {
+  const nextChildren = Array.from(next.childNodes);
+  nextChildren.forEach((nextChild, index) => {
+    const currentChild = current.childNodes[index];
+    if (!currentChild) current.appendChild(nextChild);
+    else if (!sameSlot(currentChild, nextChild)) current.replaceChild(nextChild, currentChild);
+    else patchNode(currentChild, nextChild);
+  });
+  while (current.childNodes.length > nextChildren.length) current.lastChild?.remove();
+}
+
+function sameSlot(current: Node, next: Node): boolean {
+  if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) return false;
+  return !(current instanceof Element && next instanceof Element) || current.id === next.id;
+}
+
+function patchNode(current: Node, next: Node): void {
+  if (!(current instanceof Element && next instanceof Element)) {
+    if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
+    return;
+  }
+  for (const { name } of Array.from(current.attributes)) {
+    if (!next.hasAttribute(name)) current.removeAttribute(name);
+  }
+  for (const { name, value } of Array.from(next.attributes)) {
+    if (current.getAttribute(name) !== value) current.setAttribute(name, value);
+  }
+  patchChildren(current, next);
+}
+
 function shell(content: string, pageClass = ""): string {
   return `
     <main class="app-shell ${pageClass}">
@@ -125,7 +166,7 @@ function shell(content: string, pageClass = ""): string {
 
 function renderHome(): void {
   const connection = connectionState();
-  root.innerHTML = shell(`
+  patchRoot(shell(`
     <section class="home">
       <header class="brand">
         <div class="wordmark"><span>TG</span>Lock</div>
@@ -191,14 +232,7 @@ function renderHome(): void {
         </button>
       </nav>
     </section>
-  `, "home-page");
-
-  document.querySelector("#power")?.addEventListener("click", toggleProtection);
-  document.querySelector("#open-telegram")?.addEventListener("click", openTelegram);
-  document.querySelector("#copy-link")?.addEventListener("click", copyTelegramLink);
-  document.querySelector("#copy-address")?.addEventListener("click", copyShareAddress);
-  document.querySelector("#settings-nav")?.addEventListener("click", () => navigate("settings"));
-  document.querySelector("#diagnostics-nav")?.addEventListener("click", () => navigate("diagnostics"));
+  `, "home-page"));
 }
 
 function pageHeader(title: string, subtitle: string): string {
@@ -214,7 +248,7 @@ function pageHeader(title: string, subtitle: string): string {
 }
 
 function renderSettings(): void {
-  root.innerHTML = shell(`
+  patchRoot(shell(`
     <section class="subpage">
       ${pageHeader("Настройки", "Подключение и локальная сеть")}
 
@@ -275,15 +309,12 @@ function renderSettings(): void {
         </button>
       </form>
     </section>
-  `, "subpage-shell");
-
-  document.querySelector("#back")?.addEventListener("click", () => navigate("home"));
-  document.querySelector("#settings-form")?.addEventListener("submit", saveSettings);
+  `, "subpage-shell"));
 }
 
 function renderDiagnostics(): void {
   const recentLogs = status.logs.slice(-4).reverse();
-  root.innerHTML = shell(`
+  patchRoot(shell(`
     <section class="subpage">
       ${pageHeader("Диагностика", "Состояние маршрута в реальном времени")}
 
@@ -372,11 +403,30 @@ function renderDiagnostics(): void {
         </div>
       </div>
     </section>
-  `, "subpage-shell");
-
-  document.querySelector("#copy-diagnostics")?.addEventListener("click", copyDiagnostics);
-  document.querySelector("#back")?.addEventListener("click", () => navigate("home"));
+  `, "subpage-shell"));
 }
+
+// Обработчики висят на #app, а не на кнопках: patchRoot сохраняет кнопки,
+// но новые (например, «Открыть Telegram» после включения) создаёт сам.
+const clickActions: Record<string, () => void> = {
+  power: toggleProtection,
+  "open-telegram": openTelegram,
+  "copy-link": copyTelegramLink,
+  "copy-address": copyShareAddress,
+  "settings-nav": () => navigate("settings"),
+  "diagnostics-nav": () => navigate("diagnostics"),
+  "copy-diagnostics": copyDiagnostics,
+  back: () => navigate("home"),
+};
+
+root.addEventListener("click", (event) => {
+  const button = (event.target as Element).closest<HTMLButtonElement>("button[id]");
+  if (button && !button.disabled) clickActions[button.id]?.();
+});
+
+root.addEventListener("submit", (event) => {
+  if ((event.target as Element).id === "settings-form") void saveSettings(event);
+});
 
 function render(): void {
   if (view === "settings") renderSettings();
