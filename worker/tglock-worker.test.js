@@ -77,7 +77,11 @@ async function fixture({ opened = Promise.resolve(), write, timeout = false } = 
 
 test("HTTP deployment check does not claim Telegram connectivity", async () => {
   const f = await fixture();
-  assert.equal((await f.fetch("/apiws", { Upgrade: "" })).status, 426);
+  const check = await f.fetch("/apiws", { Upgrade: "" });
+  assert.equal(check.status, 426);
+  // The browser check names the published version (#53).
+  assert.match(check.body, /^expected a websocket upgrade\nTGLock Worker \d{4}-\d{2}-\d{2}\n$/);
+  assert.match(check.headers["X-TGLock-Worker"], /^\d{4}-\d{2}-\d{2}$/);
   assert.equal(f.state.connects, 0);
 });
 

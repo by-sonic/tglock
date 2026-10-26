@@ -34,6 +34,12 @@ const CONNECT_TIMEOUT_MS = 3000;
 const MAX_PENDING_BYTES = 1024 * 1024;
 const MAX_PENDING_MESSAGES = 256;
 
+// Видна в ответе на проверку из браузера (/apiws без WebSocket). Редактор
+// Cloudflare показывает сохранённый черновик, а работает опубликованная
+// версия: без этой строки старый скрипт за новым текстом в редакторе было не
+// отличить (by-sonic/tglock#53). Меняется при каждом изменении скрипта.
+const WORKER_VERSION = "2026-10-26";
+
 // Размер бинарного кадра и способ достать его байты; null — текстовый кадр.
 //
 // С compatibility date 2026-03-17 бинарные кадры приходят как Blob, если
@@ -68,7 +74,10 @@ export default {
       return new Response("not found", { status: 404 });
     }
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-      return new Response("expected a websocket upgrade", { status: 426 });
+      return new Response(`expected a websocket upgrade\nTGLock Worker ${WORKER_VERSION}\n`, {
+        status: 426,
+        headers: { "X-TGLock-Worker": WORKER_VERSION },
+      });
     }
     // Необязательный общий секрет: задай переменную TGLOCK_TOKEN в настройках
     // воркера, и посторонние подключиться не смогут.
