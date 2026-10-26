@@ -37,7 +37,9 @@
 
 ### Проверка, что воркер жив
 
-Открой в браузере `https://tglock.имя.workers.dev/apiws`. Должно вернуться `expected a websocket upgrade` (HTTP 426). Это проверяет только публикацию скрипта. Соединение Worker → Telegram обычный GET **не проверяет**.
+Открой в браузере `https://tglock.имя.workers.dev/apiws`. Должно вернуться `expected a websocket upgrade` (HTTP 426) и строка `TGLock Worker 2026-10-26` с датой версии скрипта. Это проверяет только публикацию скрипта. Соединение Worker → Telegram обычный GET **не проверяет**.
+
+**Строки с версией нет — работает старый скрипт**, даже если в редакторе Cloudflare открыт новый текст. Редактор показывает черновик, а запросы обслуживает последняя *опубликованная* версия: после правки нужно нажать **Deploy**. Старый скрипт на новых compatibility date рвёт каждый туннель; в журнале Worker'а это предупреждение `This TransformStream is being used as a byte stream, but received an object of non-ArrayBuffer/ArrayBufferView type`, в журнале TGLock — `WebSocket закрыт без ответа Telegram`.
 
 Если вернулось `not found` — проверь, что путь именно `/apiws`. Если ошибка про `cloudflare:sockets` — у воркера слишком старая дата совместимости, поставь в **Settings → Compatibility date** сегодняшнюю.
 
