@@ -354,6 +354,136 @@ fn build_crypto_context(
     })
 }
 
+/// Длина, больше которой пакет считается не настоящим. Файлы грузятся частями
+/// по 512 КиБ, и ждать целиком заведомо мусорный «пакет» нельзя.
+const MAX_PACKET: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum Framing {
+    Abridged,
+    Intermediate,
+}
+
+/// Режет поток клиента на транспортные пакеты MTProto.
+///
+/// WebSocket-фронт Telegram разбирает один пакет на входящий кадр, а остаток
+/// кадра держит до следующего. Клиент пишет запросы пачками, и всё, что шло
+/// вторым в той же записи TCP, застревало на фронте: текст проходил, а файлы
+/// вставали. Проверено на живом фронте: `req_DH_params` вторым пакетом в кадре
+/// остаётся без ответа, пока не придёт следующий кадр, а отдельным кадром
+/// принимается сразу. Так же режет поток Flowseal/tg-ws-proxy.
+///
+/// Заголовок читается по копии: ключи `init` открыты, поэтому режим с секретом
+/// и SOCKS5 разбираются одинаково, а наружу уходят исходные байты.
+pub struct PacketSplitter {
+    framing: Option<Framing>,
+    decrypt: AesCtr,
+    wire: Vec<u8>,
+    plain: Vec<u8>,
+}
+
+impl PacketSplitter {
+    /// Разбирать поток, начатый этим `init`. Неизвестный протокол не режется.
+    pub fn from_init(init: &[u8; INIT_LEN]) -> Self {
+        let key: [u8; 32] = init[KEY_START..KEY_END].try_into().unwrap();
+        let iv: [u8; 16] = init[KEY_END..IV_END].try_into().unwrap();
+        let mut decrypt = AesCtr::new((&key).into(), (&iv).into());
+        let mut plain_init = *init;
+        decrypt.apply_keystream(&mut plain_init);
+        let framing = match [
+            plain_init[TAG_START],
+            plain_init[TAG_START + 1],
+            plain_init[TAG_START + 2],
+            plain_init[TAG_START + 3],
+        ] {
+            ABRIDGED => Some(Framing::Abridged),
+            INTERMEDIATE | PADDED_INTERMEDIATE => Some(Framing::Intermediate),
+            _ => None,
+        };
+        Self {
+            framing,
+            decrypt,
+            wire: Vec::new(),
+            plain: Vec::new(),
+        }
+    }
+
+    /// Принять зашифрованные байты, вернуть готовые к отправке пакеты.
+    pub fn push(&mut self, wire: &[u8]) -> Vec<Vec<u8>> {
+        let Some(framing) = self.framing else {
+            return vec![wire.to_vec()];
+        };
+        let start = self.plain.len();
+        self.wire.extend_from_slice(wire);
+        self.plain.extend_from_slice(wire);
+        self.decrypt.apply_keystream(&mut self.plain[start..]);
+
+        let mut packets = Vec::new();
+        let mut offset = 0;
+        while offset < self.plain.len() {
+            match packet_len(framing, &self.plain[offset..]) {
+                PacketLen::Incomplete => break,
+                PacketLen::Complete(length) => {
+                    if self.plain.len() - offset < length {
+                        break;
+                    }
+                    packets.push(self.wire[offset..offset + length].to_vec());
+                    offset += length;
+                }
+                // Длина не похожа на настоящую: поток не наш. Дальше он идёт
+                // как есть, иначе данные встанут в ожидании несуществующего конца.
+                PacketLen::Invalid => {
+                    packets.push(self.wire[offset..].to_vec());
+                    offset = self.plain.len();
+                    self.framing = None;
+                }
+            }
+        }
+        self.wire.drain(..offset);
+        self.plain.drain(..offset);
+        packets
+    }
+
+    /// Хвост незаконченного пакета: клиент закрыл соединение на середине.
+    pub fn finish(&mut self) -> Option<Vec<u8>> {
+        self.plain.clear();
+        (!self.wire.is_empty()).then(|| std::mem::take(&mut self.wire))
+    }
+}
+
+enum PacketLen {
+    Incomplete,
+    Complete(usize),
+    Invalid,
+}
+
+fn packet_len(framing: Framing, plain: &[u8]) -> PacketLen {
+    let (header, payload) = match framing {
+        Framing::Abridged => match plain {
+            [] => return PacketLen::Incomplete,
+            [0x7f | 0xff, length @ ..] => match length {
+                [a, b, c, ..] => (4, u32::from_le_bytes([*a, *b, *c, 0]) as usize * 4),
+                _ => return PacketLen::Incomplete,
+            },
+            [first, ..] => (1, (*first & 0x7f) as usize * 4),
+        },
+        Framing::Intermediate => match plain {
+            [a, b, c, d, ..] => {
+                // Старший бит просит quick ack и к длине не относится.
+                (
+                    4,
+                    (u32::from_le_bytes([*a, *b, *c, *d]) & 0x7fff_ffff) as usize,
+                )
+            }
+            _ => return PacketLen::Incomplete,
+        },
+    };
+    if payload == 0 || payload > MAX_PACKET {
+        return PacketLen::Invalid;
+    }
+    PacketLen::Complete(header + payload)
+}
+
 #[cfg(test)]
 pub(crate) fn test_client_init(secret: &[u8; 16], dc_index: i16) -> [u8; INIT_LEN] {
     tests::generate_client_init(secret, PADDED_INTERMEDIATE, dc_index)
@@ -422,6 +552,101 @@ pub(crate) fn test_relay_peer(relay_init: &[u8; INIT_LEN]) -> TestPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Поток, каким его увидел бы фронт Telegram, и разделитель для него.
+    fn splitter_for(tag: [u8; 4], plain: &[u8]) -> (PacketSplitter, Vec<u8>) {
+        let init = generate_relay_init(tag, 2);
+        let mut wire = plain.to_vec();
+        test_relay_peer(&init).decrypt(&mut wire);
+        (PacketSplitter::from_init(&init), wire)
+    }
+
+    fn intermediate(payload: &[u8]) -> Vec<u8> {
+        let mut packet = (payload.len() as u32).to_le_bytes().to_vec();
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    #[test]
+    fn glued_packets_leave_one_per_frame() {
+        let first = intermediate(&[1; 40]);
+        let second = intermediate(&[2; 340]);
+        let plain = [first.clone(), second.clone()].concat();
+        for tag in [INTERMEDIATE, PADDED_INTERMEDIATE] {
+            let (mut splitter, wire) = splitter_for(tag, &plain);
+            let packets = splitter.push(&wire);
+            assert_eq!(packets.len(), 2);
+            assert_eq!(packets[0], wire[..first.len()]);
+            assert_eq!(packets[1], wire[first.len()..]);
+            assert_eq!(splitter.finish(), None);
+        }
+    }
+
+    #[test]
+    fn a_packet_is_held_until_it_is_complete() {
+        let packet = intermediate(&[7; 300]);
+        let (mut splitter, wire) = splitter_for(INTERMEDIATE, &packet);
+        // Границы TCP не совпадают с пакетами: режем в том числе внутри длины.
+        assert!(splitter.push(&wire[..2]).is_empty());
+        assert!(splitter.push(&wire[2..150]).is_empty());
+        assert_eq!(splitter.push(&wire[150..]), vec![wire.clone()]);
+    }
+
+    #[test]
+    fn a_tail_of_one_packet_and_the_start_of_the_next_stay_separate() {
+        let first = intermediate(&[1; 40]);
+        let second = intermediate(&[2; 80]);
+        let plain = [first.clone(), second.clone()].concat();
+        let (mut splitter, wire) = splitter_for(INTERMEDIATE, &plain);
+        let packets = splitter.push(&wire[..first.len() + 10]);
+        assert_eq!(packets, vec![wire[..first.len()].to_vec()]);
+        let packets = splitter.push(&wire[first.len() + 10..]);
+        assert_eq!(packets, vec![wire[first.len()..].to_vec()]);
+    }
+
+    #[test]
+    fn quick_ack_bit_is_not_part_of_the_length() {
+        let mut packet = intermediate(&[3; 16]);
+        packet[3] |= 0x80;
+        let (mut splitter, wire) = splitter_for(INTERMEDIATE, &packet);
+        assert_eq!(splitter.push(&wire), vec![wire.clone()]);
+    }
+
+    #[test]
+    fn abridged_lengths_count_in_words_with_either_header() {
+        let short = [vec![2], vec![9; 8]].concat();
+        let long = [vec![0x7f, 0x80, 0, 0], vec![9; 512]].concat();
+        let quick_ack = [vec![0x81], vec![9; 4]].concat();
+        let plain = [short.clone(), long.clone(), quick_ack.clone()].concat();
+        let (mut splitter, wire) = splitter_for(ABRIDGED, &plain);
+        let lengths: Vec<_> = splitter.push(&wire).iter().map(Vec::len).collect();
+        assert_eq!(lengths, [short.len(), long.len(), quick_ack.len()]);
+    }
+
+    #[test]
+    fn a_length_that_cannot_be_real_stops_the_splitting_without_losing_bytes() {
+        // Если длина мусорная, ждать конца пакета значит заморозить соединение.
+        let mut garbage = 0x7fff_fff0_u32.to_le_bytes().to_vec();
+        garbage.extend_from_slice(&[5; 32]);
+        let (mut splitter, wire) = splitter_for(INTERMEDIATE, &garbage);
+        assert_eq!(splitter.push(&wire), vec![wire.clone()]);
+        assert_eq!(splitter.push(b"more"), vec![b"more".to_vec()]);
+    }
+
+    #[test]
+    fn an_unknown_protocol_passes_through_untouched() {
+        let (mut splitter, wire) = splitter_for([0x11; 4], &[0; 16]);
+        assert_eq!(splitter.push(&wire), vec![wire.clone()]);
+    }
+
+    #[test]
+    fn the_unfinished_tail_is_returned_once() {
+        let packet = intermediate(&[1; 40]);
+        let (mut splitter, wire) = splitter_for(INTERMEDIATE, &packet);
+        assert!(splitter.push(&wire[..10]).is_empty());
+        assert_eq!(splitter.finish(), Some(wire[..10].to_vec()));
+        assert_eq!(splitter.finish(), None);
+    }
 
     pub(super) fn generate_client_init(
         secret: &[u8; 16],

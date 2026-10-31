@@ -9,7 +9,9 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+// Живой адрес под нагрузкой не всегда укладывался в 4 с, а упавший маршрут уходит
+// на паузу. Столько же ждёт Flowseal/tg-ws-proxy.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const FALLBACK_DELAY: Duration = Duration::from_millis(250);
 const MAX_CONNECTING: usize = 3;
 const FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(30);
@@ -497,14 +499,118 @@ pub fn worker_allowed_destinations() -> Vec<&'static str> {
     all
 }
 
-fn canonical_dc(dc: u16) -> u16 {
-    if dc == 203 {
-        2
-    } else {
-        dc
+/// Настоящий WebSocket-фронт Telegram: адрес и имена, которые он обслуживает.
+struct WebFront {
+    ip: &'static str,
+    /// Основной кластер. Принимает и обычные соединения, и медиа.
+    host: &'static str,
+    /// Медиа-кластер (`-1`), только для медиа; см. `routes_for_dc`.
+    media_host: &'static str,
+}
+
+const fn front(ip: &'static str, host: &'static str, media_host: &'static str) -> WebFront {
+    WebFront {
+        ip,
+        host,
+        media_host,
     }
 }
 
+/// Где Telegram принимает WebSocket. Первый фронт каждого DC — тот, на который
+/// указывает `kwsN.web.telegram.org`.
+///
+/// Это не адреса из `telegram_ips`: те говорят только на родном MTProto и на
+/// TLS не отвечают из любой сети. Фронт выбирает DC по имени хоста, а не по
+/// заголовку клиента, так что имя и адрес здесь нельзя менять местами: `.220`
+/// на `kws1` отвечает редиректом. Каждая пара проверена запросом `req_DH_params`:
+/// сервер принимает только свой номер DC, поэтому за фронтом стоит именно он.
+fn web_fronts(dc: u16) -> &'static [WebFront] {
+    const DC1: &[WebFront] = &[
+        front(
+            "149.154.174.100",
+            "kws1.web.telegram.org",
+            "kws1-1.web.telegram.org",
+        ),
+        front(
+            "149.154.174.200",
+            "zws1.web.telegram.org",
+            "zws1-1.web.telegram.org",
+        ),
+        front(
+            "149.154.175.209",
+            "pluto.web.telegram.org",
+            "pluto-1.web.telegram.org",
+        ),
+    ];
+    const DC2: &[WebFront] = &[
+        front(
+            "149.154.167.220",
+            "kws2.web.telegram.org",
+            "kws2-1.web.telegram.org",
+        ),
+        front(
+            "149.154.167.99",
+            "kws2.web.telegram.org",
+            "kws2-1.web.telegram.org",
+        ),
+    ];
+    const DC3: &[WebFront] = &[
+        front(
+            "149.154.174.100",
+            "kws3.web.telegram.org",
+            "kws3-1.web.telegram.org",
+        ),
+        front(
+            "149.154.174.200",
+            "zws3.web.telegram.org",
+            "zws3-1.web.telegram.org",
+        ),
+        front(
+            "149.154.175.209",
+            "aurora.web.telegram.org",
+            "aurora-1.web.telegram.org",
+        ),
+    ];
+    const DC4: &[WebFront] = &[
+        front(
+            "149.154.167.220",
+            "kws4.web.telegram.org",
+            "kws4-1.web.telegram.org",
+        ),
+        front(
+            "149.154.167.99",
+            "kws4.web.telegram.org",
+            "kws4-1.web.telegram.org",
+        ),
+    ];
+    const DC5: &[WebFront] = &[
+        front(
+            "149.154.170.100",
+            "kws5.web.telegram.org",
+            "kws5-1.web.telegram.org",
+        ),
+        front(
+            "149.154.170.200",
+            "zws5.web.telegram.org",
+            "zws5-1.web.telegram.org",
+        ),
+        front(
+            "149.154.170.96",
+            "flora.web.telegram.org",
+            "flora-1.web.telegram.org",
+        ),
+    ];
+    match dc {
+        1 => DC1,
+        2 => DC2,
+        3 => DC3,
+        4 => DC4,
+        5 => DC5,
+        _ => &[],
+    }
+}
+
+/// Родные адреса MTProto: сюда ходит прямой TCP и Worker. TLS здесь нет.
 fn telegram_ips(dc: u16) -> &'static [&'static str] {
     match dc {
         1 => &["149.154.175.50"],
@@ -518,32 +624,32 @@ fn telegram_ips(dc: u16) -> &'static [&'static str] {
 }
 
 pub fn routes_for_dc(dc: u16, media: bool) -> Vec<Route> {
-    if telegram_ips(dc).is_empty() {
+    if dc == 203 {
+        // CDN203 has no WebSocket frontend of its own: its address speaks only
+        // native obfuscated2, and kws2 on any frontend is plain DC2, where a
+        // CDN session has neither its keys nor its data. Worker and CF proxy
+        // routes are added on top in routes_for_key.
+        return vec![Route::cdn_tcp()];
+    }
+    let fronts = web_fronts(dc);
+    if fronts.is_empty() {
         return Vec::new();
     }
-    let websocket_dc = canonical_dc(dc);
-    let primary = format!("kws{}.web.telegram.org", websocket_dc);
-    let secondary = format!("kws{}-1.web.telegram.org", websocket_dc);
-    let websocket_hosts = if media {
-        [secondary, primary]
-    } else {
-        [primary, secondary]
-    };
-    let ips = telegram_ips(dc);
-    let mut routes = Vec::new();
-    if dc == 203 {
-        // CDN203 speaks native obfuscated2 on this exact IP:443. A WebSocket
-        // handshake on the same address can time out even while MTProto is
-        // healthy. Keep the destination unchanged and use its native wire
-        // transport; never redirect CDN authorization to ordinary DC2.
-        routes.push(Route::cdn_tcp());
-    }
 
-    for websocket_host in &websocket_hosts {
-        for (index, ip) in ips.iter().enumerate() {
+    // Only media may use the `-1` hosts. That cluster rejects an ordinary
+    // connection's key exchange with -444 (measured on kws2-1 and kws4-1), and
+    // Telegram Desktop answers -444 by turning the proxy off as misconfigured.
+    let clusters: &[fn(&WebFront) -> &'static str] = if media {
+        &[|front| front.media_host, |front| front.host]
+    } else {
+        &[|front| front.host]
+    };
+    let mut routes = Vec::new();
+    for host in clusters {
+        for (index, front) in fronts.iter().enumerate() {
             routes.push(Route::https(
-                (*ip).to_owned(),
-                websocket_host.clone(),
+                front.ip.to_owned(),
+                host(front).to_owned(),
                 "/apiws".to_owned(),
                 if index == 0 {
                     RouteKind::TelegramIp
@@ -552,28 +658,18 @@ pub fn routes_for_dc(dc: u16, media: bool) -> Vec<Route> {
                 },
             ));
         }
-        // DC203 uses the DC2 hostname only for TLS/HTTP virtual hosting.
-        // Resolving it would connect to DC2 itself and send CDN sessions to
-        // the wrong data centre. Its fallback must retain the CDN address.
-        if dc != 203 {
-            routes.push(Route::https(
-                websocket_host.clone(),
-                websocket_host.clone(),
-                "/apiws".to_owned(),
-                RouteKind::SystemDns,
-            ));
-        }
+        let name = host(&fronts[0]).to_owned();
+        routes.push(Route::https(
+            name.clone(),
+            name,
+            "/apiws".to_owned(),
+            RouteKind::SystemDns,
+        ));
     }
-    // Where the WebSocket frontends are filtered but the address itself is
-    // reachable, plain MTProto to the DC's primary address still works —
-    // measured from a Russian ISP where TLS to .51/.91/.50/.100/.5 was cut
-    // while native TCP to each of them answered req_pq (main and media).
-    // 149.154.167.220 is a WebSocket frontend only and does not speak native
-    // MTProto, so it gets no TCP route. Raced only after everything above
-    // failed (race_connections).
-    if dc != 203 {
-        routes.push(Route::telegram_tcp(ips[0]));
-    }
+    // Where the frontends are out of reach, native MTProto to the DC's own
+    // address may still work. Raced only after everything above failed
+    // (race_connections).
+    routes.push(Route::telegram_tcp(telegram_ips(dc)[0]));
     routes
 }
 
@@ -724,7 +820,70 @@ mod tests {
     fn media_prefers_dash_one_websocket_host() {
         let routes = routes_for_dc(2, true);
         assert_eq!(routes[0].websocket_host, "kws2-1.web.telegram.org");
-        assert_eq!(routes[0].connect_host, "149.154.167.51");
+        assert_eq!(routes[0].connect_host, "149.154.167.220");
+    }
+
+    #[test]
+    fn only_media_may_reach_the_dash_one_cluster() {
+        // That cluster answers an ordinary key exchange with -444, and Telegram
+        // Desktop reacts by disabling the proxy as misconfigured.
+        for dc in [1, 2, 3, 4, 5] {
+            let dash_one = |route: &Route| route.websocket_host.contains("-1.");
+            assert!(
+                !routes_for_dc(dc, false).iter().any(dash_one),
+                "DC{dc} ordinary connection on a media-only cluster"
+            );
+            let media = routes_for_dc(dc, true);
+            assert!(dash_one(&media[0]), "DC{dc}: {:?}", media[0]);
+            // The main cluster accepts media too, so it stays as a fallback.
+            assert!(media
+                .iter()
+                .any(|route| route.websocket_host == format!("kws{dc}.web.telegram.org")));
+        }
+    }
+
+    #[test]
+    fn websocket_routes_only_dial_real_frontends() {
+        // The native addresses speak MTProto and answer TLS with garbage from
+        // any network, so a WebSocket route there can never connect.
+        for dc in [1, 2, 3, 4, 5, 203] {
+            for media in [false, true] {
+                for route in routes_for_dc(dc, media) {
+                    if route.kind == RouteKind::TelegramTcp || route.kind == RouteKind::SystemDns {
+                        continue;
+                    }
+                    assert!(
+                        web_fronts(dc)
+                            .iter()
+                            .any(|front| front.ip == route.connect_host),
+                        "DC{dc}: {route:?}"
+                    );
+                    assert!(route.secure, "DC{dc}: {route:?}");
+                    assert_ne!(route.connect_host, telegram_ips(dc)[0], "DC{dc}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frontends_are_only_dialled_under_a_name_they_serve() {
+        // A frontend picks the DC from the Host header, not from the client's
+        // init: kws2 is DC2 whatever the header says, and .220 redirects kws1.
+        for (dc, name) in [
+            (1, "kws1."),
+            (2, "kws2."),
+            (3, "kws3."),
+            (4, "kws4."),
+            (5, "kws5."),
+        ] {
+            let routes = routes_for_dc(dc, false);
+            assert!(routes[0].websocket_host.starts_with(name), "{routes:?}");
+            let front = &web_fronts(dc)[0];
+            assert_eq!(routes[0].connect_host, front.ip);
+        }
+        assert!(routes_for_dc(1, false)
+            .iter()
+            .all(|route| route.connect_host != "149.154.167.220"));
     }
 
     #[test]
@@ -734,7 +893,7 @@ mod tests {
         assert!(routes[0].websocket_host.is_empty());
         assert!(!routes[0].secure);
         assert_eq!(routes[0].connect_host, "91.105.192.100");
-        assert_eq!(routes[1].websocket_host, "kws2.web.telegram.org");
+        assert_eq!(routes.len(), 1, "CDN203 has no WebSocket frontend");
         assert!(routes
             .iter()
             .all(|route| route.connect_host == "91.105.192.100"));
