@@ -4,28 +4,34 @@
 // https://core.telegram.org/mtproto/auth_key
 // https://core.telegram.org/mtproto/mtproto-transports#transport-obfuscation
 // https://core.telegram.org/mtproto/description#unencrypted-message
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createPublicKey, randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import assert from "node:assert/strict";
 
 const MAX_RESPONSE = 2 * 1024 * 1024;
-const HELP = `Usage: node scripts/probe_proxy.mjs --secret-file PATH [--port 1080] [--dc 2] [--timeout-ms 15000] [--fragment-size 0]
+const HELP = `Usage: node scripts/probe_proxy.mjs --secret-file PATH [--port 1080] [--dc 2] [--timeout-ms 15000] [--fragment-size 0] [--identity] [--batched]
 Or: node scripts/probe_proxy.mjs --direct-cdn --dc 203
 DC: 1..5 or 203; negative values request the media route.
 Default connects only to 127.0.0.1. --direct-cdn explicitly probes only 91.105.192.100:443 without a secret.
 Reads the local proxy secret from the explicit file; never prints it.
 Sends one req_pq_multi and checks resPQ/nonce. No account, API credentials, login or auth key is created.
-This proves a protocol response, not DC identity, account operation or media downloads.
+Without --identity this proves a protocol response, not DC identity, account operation or media downloads.
+--identity continues with req_DH_params: the server checks the DC number sealed inside it against itself
+and answers -444 on a mismatch, so this proves WHICH data centre is behind the route. The key is never finished.
+--batched sends req_DH_params glued behind another packet in one write, the way real clients batch requests.
+A WebSocket frontend reads one packet per frame, so a proxy that does not split the stream times out here.
 Use --self-test for offline parser checks; --fragment-size 7 sends small writes with 2ms gaps.`;
 
 function options(args) {
-  const result = { port: 1080, dc: 2, timeoutMs: 15000, fragmentSize: 0 };
+  const result = { port: 1080, dc: 2, timeoutMs: 15000, fragmentSize: 0, identity: false, batched: false };
   const numeric = { "--port": "port", "--dc": "dc", "--timeout-ms": "timeoutMs", "--fragment-size": "fragmentSize" };
   for (let i = 0; i < args.length; i++) {
     const name = args[i];
     if (name === "--direct-cdn") { result.directCdn = true; continue; }
+    if (name === "--identity") { result.identity = true; continue; }
+    if (name === "--batched") { result.identity = result.batched = true; continue; }
     const value = args[++i];
     if (value === undefined) throw new Error(`Missing value for ${name}`);
     if (name === "--secret-file") result.secretFile = value;
@@ -39,6 +45,110 @@ function options(args) {
   if (result.timeoutMs < 100 || result.timeoutMs > 120000) throw new Error("Timeout must be 100..120000ms");
   if (result.fragmentSize < 0 || result.fragmentSize > 65536) throw new Error("Fragment size must be 0..65536");
   return result;
+}
+
+// Production key from Telegram Desktop (mtproto_dc_options.cpp). CDN data centres
+// use their own keys, so a CDN simply does not list this fingerprint.
+const TELEGRAM_RSA_KEY = `-----BEGIN RSA PUBLIC KEY-----
+MIIBCgKCAQEA6LszBcC1LGzyr992NzE0ieY+BSaOW622Aa9Bd4ZHLl+TuFQ4lo4g
+5nKaMBwK/BIb9xUfg0Q29/2mgIR6Zr9krM7HjuIcCzFvDtr+L0GQjae9H0pRB2OO
+62cECs5HKhT5DZ98K33vmWiLowc621dQuwKWSQKjWf50XYFw42h21P2KXUGyp2y/
++aEyZ+uVgLLQbRA1dEjSDZ2iGRy12Mk5gpYc397aYp438fsJoHIgJ2lgMv5h7WY9
+t6N/byY9Nw9p21Og3AoXSL2q/2IJ1WRUhebgAdGVMlV1fkuOQoEzR7EdpqtQD9Cs
+5+bfo3Nhmcyvk5ftB0WkJ9z6bNZ7yxrP8wIDAQAB
+-----END RSA PUBLIC KEY-----`;
+
+const tlBytes = (value) => {
+  const prefixed = Buffer.concat([Buffer.from([value.length]), value]);
+  const long = Buffer.concat([Buffer.from([254, value.length & 255, value.length >> 8, 0]), value]);
+  const raw = value.length < 254 ? prefixed : long;
+  return Buffer.concat([raw, Buffer.alloc((4 - raw.length % 4) % 4)]);
+};
+const toBigInt = (bytes) => BigInt(`0x${bytes.toString("hex")}`);
+const rsaKey = () => {
+  const { n, e } = createPublicKey({ key: TELEGRAM_RSA_KEY, format: "pem", type: "pkcs1" }).export({ format: "jwk" });
+  const modulus = Buffer.from(n, "base64url");
+  const exponent = Buffer.from(e, "base64url");
+  const fingerprint = createHash("sha1").update(tlBytes(modulus)).update(tlBytes(exponent)).digest().subarray(12);
+  return { modulus: toBigInt(modulus), exponent: toBigInt(exponent), fingerprint };
+};
+function modPow(base, power, modulus) {
+  let result = 1n;
+  for (let b = base % modulus, e = power; e > 0n; e >>= 1n, b = b * b % modulus) if (e & 1n) result = result * b % modulus;
+  return result;
+}
+function factorize(pq) {
+  const gcd = (a, b) => { while (b) [a, b] = [b, a % b]; return a; };
+  for (let c = 1n; ; c++) {
+    const step = (x) => (x * x + c) % pq;
+    let slow = 2n, fast = 2n, divisor = 1n;
+    while (divisor === 1n) { slow = step(slow); fast = step(step(fast)); divisor = gcd(slow > fast ? slow - fast : fast - slow, pq); }
+    if (divisor !== pq) { const other = pq / divisor; return divisor < other ? [divisor, other] : [other, divisor]; }
+  }
+}
+function aesIgeEncrypt(data, key) {
+  const output = Buffer.alloc(data.length);
+  let previousCipher = Buffer.alloc(16), previousPlain = Buffer.alloc(16);
+  for (let offset = 0; offset < data.length; offset += 16) {
+    const block = data.subarray(offset, offset + 16), mixed = Buffer.alloc(16);
+    for (let i = 0; i < 16; i++) mixed[i] = block[i] ^ previousCipher[i];
+    const encrypted = createCipheriv("aes-256-ecb", key, null).setAutoPadding(false).update(mixed);
+    for (let i = 0; i < 16; i++) output[offset + i] = encrypted[i] ^ previousPlain[i];
+    previousCipher = output.subarray(offset, offset + 16);
+    previousPlain = block;
+  }
+  return output;
+}
+// RSA_PAD from https://core.telegram.org/mtproto/auth_key#41-rsa-paddata-server-public-key-mentioned-above-is-implemented-as-follows
+function rsaPad(data, key) {
+  const padded = Buffer.concat([data, randomBytes(192 - data.length)]);
+  for (;;) {
+    const tempKey = randomBytes(32);
+    const hashed = Buffer.concat([Buffer.from(padded).reverse(), createHash("sha256").update(tempKey).update(padded).digest()]);
+    const encrypted = aesIgeEncrypt(hashed, tempKey);
+    const mask = createHash("sha256").update(encrypted).digest();
+    const masked = Buffer.from(tempKey.map((byte, index) => byte ^ mask[index]));
+    const value = toBigInt(Buffer.concat([masked, encrypted]));
+    if (value < key.modulus) return Buffer.from(modPow(value, key.exponent, key.modulus).toString(16).padStart(512, "0"), "hex");
+  }
+}
+function unencryptedPacket(body) {
+  const message = Buffer.alloc(20 + body.length);
+  const now = BigInt(Date.now());
+  message.writeBigUInt64LE(((now / 1000n << 32n) | ((now % 1000n) * (1n << 32n) / 1000n)) & ~3n, 8);
+  message.writeUInt32LE(body.length, 16);
+  body.copy(message, 20);
+  const padded = Buffer.concat([message, randomBytes(7)]);
+  const length = Buffer.alloc(4);
+  length.writeUInt32LE(padded.length);
+  return Buffer.concat([length, padded]);
+}
+const reqPqBody = (nonce) => {
+  const constructor = Buffer.alloc(4);
+  constructor.writeUInt32LE(0xbe7e8ef1);
+  return Buffer.concat([constructor, nonce]);
+};
+function reqDhParams(resPQ, nonce, dc, key) {
+  const [p, q] = factorize(toBigInt(resPQ.pq));
+  const bigEndian = (value) => Buffer.from(value.toString(16).padStart(8, "0"), "hex");
+  const dcField = Buffer.alloc(4);
+  dcField.writeInt32LE(dc);
+  const inner = Buffer.concat([Buffer.from("955ff5a9", "hex"), tlBytes(resPQ.pq), tlBytes(bigEndian(p)), tlBytes(bigEndian(q)),
+    nonce, resPQ.serverNonce, randomBytes(32), dcField]);
+  return Buffer.concat([Buffer.from("bee412d7", "hex"), nonce, resPQ.serverNonce, tlBytes(bigEndian(p)), tlBytes(bigEndian(q)),
+    key.fingerprint, tlBytes(rsaPad(inner, key))]);
+}
+function parseDhReply(frame) {
+  if (frame.length < 24 || frame.readBigUInt64LE() !== 0n) {
+    const code = frame.readInt32LE();
+    throw new Error(code === -444
+      ? "MTProto transport error -444: this route leads to the wrong data centre"
+      : `MTProto transport error ${code}`);
+  }
+  const constructor = frame.readUInt32LE(20);
+  if (constructor === 0x05162463) return null; // the reply to the packet batched in front
+  if (constructor !== 0xd0e8075c) throw new Error(`Unexpected reply 0x${constructor.toString(16)} to req_DH_params`);
+  return "accepted";
 }
 
 function makeRequest(secret, dc) {
@@ -68,7 +178,7 @@ function makeRequest(secret, dc) {
   const padded = Buffer.concat([payload, randomBytes(7)]);
   const length = Buffer.alloc(4);
   length.writeUInt32LE(padded.length);
-  return { wire: Buffer.concat([wireHeader, encrypt.update(Buffer.concat([length, padded]))]), decrypt, nonce };
+  return { wire: Buffer.concat([wireHeader, encrypt.update(Buffer.concat([length, padded]))]), encrypt, decrypt, nonce };
 }
 
 function parseResPQ(frame, nonce) {
@@ -90,7 +200,11 @@ function parseResPQ(frame, nonce) {
   // Validate the complete TL object fits; do not mistake padding for corruption.
   if (count < 1 || count > 64 || vectorOffset + 8 + count * 8 > body.length) throw new Error("Invalid RSA fingerprint count");
   // Deliberately do not infer DC identity from these public fingerprints.
-  return { response: "resPQ", nonceMatches: true, rsaFingerprintCount: count };
+  const fingerprints = [];
+  for (let i = 0; i < count; i++) fingerprints.push(body.subarray(vectorOffset + 8 + i * 8, vectorOffset + 16 + i * 8));
+  const handshake = { serverNonce: body.subarray(20, 36), pq: body.subarray(37, 37 + pqLength), fingerprints };
+  return Object.defineProperty({ response: "resPQ", nonceMatches: true, rsaFingerprintCount: count },
+    "handshake", { value: handshake, enumerable: false });
 }
 
 async function probe(config) {
@@ -101,7 +215,8 @@ async function probe(config) {
     if (!/^[0-9a-f]{32}$/i.test(hex)) throw new Error("Secret file must contain 32 hex characters or dd followed by 32 hex characters");
     secret = Buffer.from(hex, "hex");
   }
-  const { wire, decrypt, nonce } = makeRequest(secret, config.dc);
+  const { wire, encrypt, decrypt, nonce } = makeRequest(secret, config.dc);
+  let resPQ = null;
   const started = Date.now();
   return new Promise((resolve, reject) => {
     const socket = createConnection(config.directCdn
@@ -118,7 +233,7 @@ async function probe(config) {
       if (error) reject(error);
       else resolve({ transport: config.directCdn ? "direct-cdn-tcp" : "local-proxy", requestedDc: config.dc, ...result, elapsedMs: Date.now() - started });
     };
-    const timer = setTimeout(() => finish(new Error("Timed out waiting for resPQ")), config.timeoutMs);
+    const timer = setTimeout(() => finish(new Error(resPQ ? "Timed out waiting for the reply to req_DH_params" : "Timed out waiting for resPQ")), config.timeoutMs);
     socket.on("error", (error) => finish(error));
     socket.on("end", () => finish(new Error("Proxy closed before a complete resPQ response")));
     socket.on("data", (chunk) => {
@@ -138,8 +253,23 @@ async function probe(config) {
             pending = pending.subarray(4 + length); // padded intermediate quick ACK
             continue;
           }
-          finish(null, parseResPQ(pending.subarray(4, 4 + length), nonce));
-          return;
+          const frame = pending.subarray(4, 4 + length);
+          pending = pending.subarray(4 + length);
+          if (resPQ) {
+            const verdict = parseDhReply(frame);
+            if (verdict) { finish(null, { ...resPQ, identity: verdict, signedDc: config.dc, batched: config.batched }); return; }
+            continue;
+          }
+          resPQ = parseResPQ(frame, nonce);
+          if (!config.identity) { finish(null, resPQ); return; }
+          const key = rsaKey();
+          if (!resPQ.handshake.fingerprints.some((fingerprint) => fingerprint.equals(key.fingerprint))) {
+            finish(null, { ...resPQ, identity: "skipped: CDN keys" });
+            return;
+          }
+          const request = unencryptedPacket(reqDhParams(resPQ.handshake, nonce, config.dc, key));
+          const batch = config.batched ? [unencryptedPacket(reqPqBody(randomBytes(16))), request] : [request];
+          socket.write(encrypt.update(Buffer.concat(batch)));
         }
       } catch (error) { finish(error); }
     });
@@ -177,6 +307,9 @@ function selfTest() {
   oversizedVector.writeUInt32LE(65, 72);
   assert.throws(() => parseResPQ(oversizedVector, nonce), /count/);
   assert.throws(() => parseResPQ(Buffer.from("6cfeffff", "hex"), nonce), /-404/);
+  assert.throws(() => parseDhReply(Buffer.from("44feffff", "hex")), /wrong data centre/);
+  assert.equal(rsaKey().fingerprint.toString("hex"), Buffer.from("d09d1d85de64fd85", "hex").reverse().toString("hex"));
+  assert.deepEqual(factorize(0x17ED48941A08F981n), [0x494C553Bn, 0x53911073n]);
   console.log("Offline parser checks passed; no network connection made.");
 }
 

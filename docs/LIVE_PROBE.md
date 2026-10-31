@@ -40,6 +40,26 @@ authenticate the responding server, prove its DC identity, log into an account,
 or verify message sending, media downloads or Android lifecycle. In particular,
 `requestedDc` describes the request, not an independently confirmed backend.
 
+## Confirm which data centre answers
+
+`--identity` continues the handshake with `req_DH_params`. The DC number sealed
+inside it is checked by the server against itself, and a mismatch is answered
+with transport error `-444`, so this does prove the backend. `resPQ` alone proves
+nothing here: every server answers it for any DC in the header. The handshake
+stops before an authorization key exists. CDN DC203 uses its own RSA keys, so
+the report says `identity: "skipped: CDN keys"` for it.
+
+`--batched` implies `--identity` and sends `req_DH_params` glued behind another
+packet in one write, the way real clients batch requests. A WebSocket frontend
+reads one packet per frame, so a proxy that forwards the write as a single frame
+times out here while a lone request still passes. Run it before every release:
+
+```sh
+for dc in 1 2 -2 3 4 -4 5 203; do
+  node scripts/probe_proxy.mjs --port 18080 --secret-file /private/path/tglock-secret --dc $dc --batched
+done
+```
+
 ## Isolate CDN transport failures
 
 To distinguish an unavailable CDN WebSocket endpoint from an unavailable CDN

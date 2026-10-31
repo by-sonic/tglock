@@ -20,6 +20,9 @@ use std::path::{Path, PathBuf};
 /// Имя файла, который ищется рядом с бинарём, если `--config` не задан.
 pub const DEFAULT_FILE_NAME: &str = "tglock.toml";
 
+/// Размер журнала, после которого он сменяется. Как в Flowseal/tg-ws-proxy.
+pub const DEFAULT_LOG_MAX_MB: u32 = 5;
+
 /// Содержимое файла конфигурации.
 ///
 /// `deny_unknown_fields` намеренно: опечатка вроде `porrt = 1080` должна быть
@@ -38,6 +41,9 @@ pub struct FileConfig {
     pub secret: Option<String>,
     pub secret_file: Option<PathBuf>,
     pub quiet: Option<bool>,
+    /// Писать журнал в файл, а не в stdout (by-sonic/tglock#53).
+    pub log_file: Option<PathBuf>,
+    pub log_max_mb: Option<u32>,
 }
 
 impl FileConfig {
@@ -63,6 +69,8 @@ pub struct Overrides {
     pub cf_proxy: Vec<String>,
     pub secret_file: Option<PathBuf>,
     pub quiet: bool,
+    pub log_file: Option<PathBuf>,
+    pub log_max_mb: Option<u32>,
 }
 
 /// Откуда взять секрет прокси.
@@ -86,6 +94,8 @@ pub struct Resolved {
     pub cf_proxies: String,
     pub secret: SecretSource,
     pub quiet: bool,
+    pub log_file: Option<PathBuf>,
+    pub log_max_mb: u32,
 }
 
 impl Resolved {
@@ -139,6 +149,14 @@ pub fn resolve(file: FileConfig, cli: Overrides) -> Result<Resolved, String> {
         cli.cf_proxy
     };
 
+    let log_max_mb = cli
+        .log_max_mb
+        .or(file.log_max_mb)
+        .unwrap_or(DEFAULT_LOG_MAX_MB);
+    if log_max_mb == 0 {
+        return Err("log_max_mb должен быть не меньше 1".to_owned());
+    }
+
     // Секрет из файла конфигурации важнее отдельного файла: если человек вписал
     // его сюда, значит хотел держать всё в одном месте.
     let secret = match (&file.secret, cli.secret_file.or(file.secret_file)) {
@@ -156,6 +174,8 @@ pub fn resolve(file: FileConfig, cli: Overrides) -> Result<Resolved, String> {
         cf_proxies: cf_proxies.join(","),
         secret,
         quiet: cli.quiet || file.quiet.unwrap_or(false),
+        log_file: cli.log_file.or(file.log_file),
+        log_max_mb,
     })
 }
 
@@ -187,6 +207,31 @@ mod tests {
         assert_eq!(resolved.workers, "");
         assert_eq!(resolved.secret, SecretSource::Ephemeral);
         assert!(!resolved.quiet);
+    }
+
+    #[test]
+    fn log_file_comes_from_the_file_and_a_flag_overrides_it() {
+        let from_file =
+            || FileConfig::parse("log_file = \"/tmp/tglock.log\"\nlog_max_mb = 2").unwrap();
+        let resolved = resolve(from_file(), cli()).unwrap();
+        assert_eq!(resolved.log_file, Some(PathBuf::from("/tmp/tglock.log")));
+        assert_eq!(resolved.log_max_mb, 2);
+
+        let flags = Overrides {
+            log_file: Some(PathBuf::from("/var/log/t.log")),
+            log_max_mb: Some(1),
+            ..cli()
+        };
+        let resolved = resolve(from_file(), flags).unwrap();
+        assert_eq!(resolved.log_file, Some(PathBuf::from("/var/log/t.log")));
+        assert_eq!(resolved.log_max_mb, 1);
+    }
+
+    #[test]
+    fn a_zero_log_limit_is_refused() {
+        // Иначе файл менялся бы на каждой строке.
+        let file = FileConfig::parse("log_max_mb = 0").unwrap();
+        assert!(resolve(file, cli()).unwrap_err().contains("log_max_mb"));
     }
 
     #[test]

@@ -6,12 +6,14 @@
 //! (by-sonic/tglock#10, by-sonic/tglock#17).
 
 use clap::Parser;
+use std::fs::File;
+use std::io::Write;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tglock_lib::cli_settings as config;
 use tglock_lib::{proxy, transport};
 
@@ -23,9 +25,142 @@ const STATUS_POLL: Duration = Duration::from_secs(1);
 /// пускают в `head`, закрывают терминал, перезапускают сборщик логов. Падать из
 /// за этого туннель не должен — он продолжает работать молча.
 fn say(text: &str) -> bool {
-    use std::io::Write;
+    if let Some(log) = LOG_FILE.get() {
+        // `false` здесь значило бы «писать больше некому», а это не так: диск
+        // могло временно заполнить. Журнал продолжается со следующей строки.
+        log.lock().unwrap().record(text);
+        return true;
+    }
     let mut out = std::io::stdout().lock();
     writeln!(out, "{text}").and_then(|()| out.flush()).is_ok()
+}
+
+/// Журнал вместо stdout, если задан `--log-file`.
+static LOG_FILE: OnceLock<Mutex<LogFile>> = OnceLock::new();
+
+/// Файл журнала с ротацией.
+///
+/// На роутере stdout сервиса уходит в системный журнал, и TGLock забивал его
+/// строками состояния (by-sonic/tglock#53). Заполненный файл переименовывается
+/// в `<имя>.1`, поэтому на диске лежит не больше двух файлов: flash и память
+/// роутера не резиновые.
+struct LogFile {
+    path: PathBuf,
+    /// `None` только внутри ротации: Windows не переименует открытый файл.
+    file: Option<File>,
+    written: u64,
+    limit: u64,
+    /// Об ошибке записи сообщается один раз, а не на каждой строке.
+    failing: bool,
+}
+
+impl LogFile {
+    fn open(path: PathBuf, limit: u64) -> std::io::Result<Self> {
+        let file = open_log(&path)?;
+        let written = file.metadata()?.len();
+        Ok(Self {
+            path,
+            file: Some(file),
+            written,
+            limit,
+            failing: false,
+        })
+    }
+
+    fn record(&mut self, text: &str) {
+        match self.write_line(text) {
+            Ok(()) => self.failing = false,
+            Err(error) if !self.failing => {
+                self.failing = true;
+                eprintln!(
+                    "tglock-cli: журнал {} не пишется: {error}",
+                    self.path.display()
+                );
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn write_line(&mut self, text: &str) -> std::io::Result<()> {
+        let line = format!("{} {text}\n", timestamp(now_seconds()));
+        if self.written > 0 && self.written + line.len() as u64 > self.limit {
+            self.rotate()?;
+        }
+        if self.file.is_none() {
+            self.file = Some(open_log(&self.path)?);
+        }
+        let file = self.file.as_mut().ok_or(std::io::ErrorKind::NotFound)?;
+        file.write_all(line.as_bytes())?;
+        file.flush()?;
+        self.written += line.len() as u64;
+        Ok(())
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        let mut backup = self.path.clone().into_os_string();
+        backup.push(".1");
+        self.file = None;
+        // rename заменяет старый бэкап сам, и если он не удался, бэкап цел.
+        let renamed = std::fs::rename(&self.path, &backup);
+        let file = open_log(&self.path)?;
+        // Файл могли удалить или держать другой программой. Тогда предел
+        // важнее старых строк: журнал не должен съесть память роутера.
+        if renamed.is_err() {
+            // Отдельным открытием: файл для дозаписи на Windows нельзя обрезать.
+            File::options()
+                .write(true)
+                .truncate(true)
+                .open(&self.path)?;
+        }
+        self.file = Some(file);
+        self.written = 0;
+        Ok(())
+    }
+}
+
+/// В журнал попадает ссылка `tg://proxy` с секретом: читать его может только
+/// владелец, даже если файл появился раньше и с другими правами.
+fn open_log(path: &Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// `2026-10-31 09:30:00` в UTC. Перевод дней в дату — civil_from_days из
+/// https://howardhinnant.github.io/date_algorithms.html
+fn timestamp(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        (seconds / 3600) % 24,
+        (seconds / 60) % 60,
+        seconds % 60
+    )
 }
 
 #[derive(Debug, Parser)]
@@ -72,6 +207,15 @@ struct Args {
     /// Печатать только ошибки
     #[arg(short, long)]
     quiet: bool,
+
+    /// Писать журнал в этот файл, а не в stdout. Ошибки запуска всё равно идут
+    /// в stderr. Заполненный файл переименовывается в <имя>.1
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
+
+    /// Размер файла журнала в МБ, после которого он сменяется. По умолчанию 5
+    #[arg(long, value_name = "MB")]
+    log_max_mb: Option<u32>,
 }
 
 impl Args {
@@ -85,6 +229,8 @@ impl Args {
             cf_proxy: self.cf_proxy.clone(),
             secret_file: self.secret_file.clone(),
             quiet: self.quiet,
+            log_file: self.log_file.clone(),
+            log_max_mb: self.log_max_mb,
         }
     }
 
@@ -129,6 +275,11 @@ async fn serve(args: Args) -> Result<(), String> {
     let listen = settings.listen;
     let stats = settings.stats();
     let quiet = settings.quiet;
+    if let Some(path) = &settings.log_file {
+        let log = LogFile::open(path.clone(), u64::from(settings.log_max_mb) * 1024 * 1024)
+            .map_err(|error| format!("не удалось открыть журнал {}: {error}", path.display()))?;
+        let _ = LOG_FILE.set(Mutex::new(log));
+    }
 
     // Bind before printing anything: a busy port must be an error, not a
     // daemon that reports success and silently does nothing.
@@ -289,6 +440,114 @@ mod tests {
     /// Итоговые настройки только из флагов, без файла.
     fn from_flags(args: &[&str]) -> config::Resolved {
         config::resolve(config::FileConfig::default(), parse(args).overrides()).unwrap()
+    }
+
+    /// Пустой каталог для одного теста, удаляется вместе с ним.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "tglock-cli-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn log_rotation_keeps_the_newest_lines_in_two_bounded_files() {
+        let dir = TempDir::new("rotation");
+        let path = dir.0.join("tglock.log");
+        let mut log = LogFile::open(path.clone(), 200).unwrap();
+        for line in 0..40 {
+            log.write_line(&format!("line {line}")).unwrap();
+        }
+        let current = std::fs::read_to_string(&path).unwrap();
+        let backup = std::fs::read_to_string(dir.0.join("tglock.log.1")).unwrap();
+        assert!(current.contains("line 39"), "{current}");
+        assert!(current.len() <= 200 && backup.len() <= 200);
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn a_log_deleted_by_hand_is_recreated_and_stays_bounded() {
+        let dir = TempDir::new("deleted");
+        let path = dir.0.join("tglock.log");
+        let mut log = LogFile::open(path.clone(), 200).unwrap();
+        log.write_line("before").unwrap();
+        // На Windows открытый файл не удалить, поэтому он закрывается как при
+        // ротации. На unix запись шла бы в удалённый файл до предела.
+        log.file = None;
+        std::fs::remove_file(&path).unwrap();
+        for line in 0..40 {
+            log.write_line(&format!("line {line}")).unwrap();
+        }
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(current.contains("line 39"), "{current}");
+        assert!(current.len() <= 200);
+    }
+
+    #[test]
+    fn a_failed_rotation_keeps_the_old_backup_and_the_size_limit() {
+        let dir = TempDir::new("failed-rotation");
+        let path = dir.0.join("tglock.log");
+        let mut log = LogFile::open(path.clone(), 200).unwrap();
+        std::fs::write(dir.0.join("tglock.log.1"), "old backup").unwrap();
+        log.write_line("x").unwrap();
+        // Файл исчез до ротации: переименовывать нечего.
+        log.file = None;
+        std::fs::remove_file(&path).unwrap();
+        log.rotate().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("tglock.log.1")).unwrap(),
+            "old backup"
+        );
+        assert_eq!(log.written, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_log_with_wide_permissions_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("permissions");
+        let path = dir.0.join("tglock.log");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        LogFile::open(path.clone(), 200).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_restarted_daemon_continues_the_log_and_counts_what_is_there() {
+        let dir = TempDir::new("restart");
+        let path = dir.0.join("tglock.log");
+        LogFile::open(path.clone(), 10_000)
+            .unwrap()
+            .write_line("first run")
+            .unwrap();
+        let mut log = LogFile::open(path.clone(), 10_000).unwrap();
+        assert!(log.written > 0);
+        log.write_line("second run").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("first run") && text.contains("second run"));
+    }
+
+    #[test]
+    fn timestamps_are_calendar_dates_in_utc() {
+        assert_eq!(timestamp(0), "1970-01-01 00:00:00");
+        assert_eq!(timestamp(951_782_400), "2000-02-29 00:00:00");
+        assert_eq!(timestamp(1_793_442_645), "2026-10-31 10:30:45");
     }
 
     #[test]

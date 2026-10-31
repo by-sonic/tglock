@@ -513,12 +513,29 @@ async function copyTelegramLink(): Promise<void> {
   }
 }
 
+// Отчёт публикуют в issue: домен Worker'а и свой домен CF-прокси туда не идут,
+// Worker можно задать и адресом, поэтому оставляются только адреса Telegram.
+// Они и имена Telegram нужны, чтобы понять, какой маршрут не ответил.
+function publicLogLine(message: string): string {
+  return message.replace(/[\w-]+(?:\.[\w-]+)+/g, (host) =>
+    /^(149\.154|91\.105|91\.108)\.[\d.]+$/.test(host) || host.endsWith(".telegram.org") ? host : "<домен>");
+}
+
+function failureLog(): string[] {
+  const failure = /^(Не поднялся туннель|Сбой туннеля|Обрыв туннеля)/;
+  const paused = /на паузе после ошибок/;
+  return status.logs
+    .filter(({ message }) => failure.test(message) && !paused.test(message))
+    .slice(-20)
+    .map(({ timestamp, message }) => `${timestamp} ${publicLogLine(message)}`);
+}
+
 async function copyDiagnostics(): Promise<void> {
   try {
-    // Public reports exclude proxy links, worker domains and free-form logs.
+    // Public reports exclude proxy links and secrets.
     const report = {
       application: "TGLock",
-      version: "2.0.0-beta.18",
+      version: "2.0.0-beta.19",
       running: status.running,
       activeConnections: status.activeConnections,
       tunnels: status.tunnels,
@@ -532,9 +549,10 @@ async function copyDiagnostics(): Promise<void> {
       uptimeSeconds: status.uptimeSeconds,
       port: status.port,
       lanMode: settings.lanMode,
+      failureLog: failureLog(),
     };
     await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
-    showToast("Диагностика скопирована без адресов и секретов");
+    showToast("Диагностика скопирована без секретов и своих доменов");
   } catch { showToast("Буфер обмена недоступен", true); }
 }
 
