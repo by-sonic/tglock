@@ -17,6 +17,7 @@ const MAX_CONNECTING: usize = 3;
 const FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(30);
 const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
 const HTTPS_PORT: u16 = 443;
+const HTTP_PORT: u16 = 80;
 const CDN203_IP: &str = "91.105.192.100";
 
 pub type TelegramWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -39,6 +40,9 @@ pub enum RouteKind {
     /// и Cloudflare сам доводит WebSocket до дата-центра. Worker и его лимиты
     /// не нужны — так работает CF-прокси в Flowseal/tg-ws-proxy.
     CloudflareProxy,
+    /// WebSocket без TLS на порту 80 родного адреса DC. Единственный прямой
+    /// WebSocket к CDN203, у которого нет фронта на 443.
+    TelegramPlainWs,
 }
 
 impl RouteKind {
@@ -50,6 +54,7 @@ impl RouteKind {
             Self::CloudflareWorker => 4,
             Self::TelegramTcp => 5,
             Self::CloudflareProxy => 6,
+            Self::TelegramPlainWs => 7,
         }
     }
 
@@ -61,6 +66,7 @@ impl RouteKind {
             4 => Some(Self::CloudflareWorker),
             5 => Some(Self::TelegramTcp),
             6 => Some(Self::CloudflareProxy),
+            7 => Some(Self::TelegramPlainWs),
             _ => None,
         }
     }
@@ -74,6 +80,7 @@ impl RouteKind {
             Self::CloudflareWorker => "Cloudflare Worker",
             Self::TelegramTcp => "Telegram TCP (MTProto)",
             Self::CloudflareProxy => "Cloudflare-прокси",
+            Self::TelegramPlainWs => "Telegram WebSocket (порт 80)",
         }
     }
 }
@@ -111,6 +118,23 @@ impl Route {
             path: String::new(),
             kind: RouteKind::TelegramTcp,
             port: HTTPS_PORT,
+            secure: false,
+        }
+    }
+
+    /// WebSocket to a native Telegram address on port 80.
+    ///
+    /// There is no TLS here, but no less protection than on `telegram_tcp`: the
+    /// payload is the same obfuscated MTProto stream, and MTProto authenticates
+    /// the server itself. Here the address picks the DC and the Host header does
+    /// not matter, so the address is all that goes in it.
+    fn plain_ws(ip: &str) -> Self {
+        Self {
+            connect_host: ip.to_owned(),
+            websocket_host: ip.to_owned(),
+            path: "/apiws".to_owned(),
+            kind: RouteKind::TelegramPlainWs,
+            port: HTTP_PORT,
             secure: false,
         }
     }
@@ -329,10 +353,17 @@ impl TransportEngine {
                         }
                         Err(error) => {
                             self.record_failure(&route);
-                            let endpoint = if route.kind == RouteKind::TelegramTcp {
-                                format!("{}:{} (MTProto TCP)", route.connect_host, route.port)
-                            } else {
-                                format!("{} (TLS {})", route.connect_host, route.websocket_host)
+                            let endpoint = match route.kind {
+                                RouteKind::TelegramTcp => {
+                                    format!("{}:{} (MTProto TCP)", route.connect_host, route.port)
+                                }
+                                RouteKind::TelegramPlainWs => {
+                                    format!("{}:{} (WebSocket)", route.connect_host, route.port)
+                                }
+                                _ => format!(
+                                    "{} (TLS {})",
+                                    route.connect_host, route.websocket_host
+                                ),
                             };
                             errors.push(format!("{endpoint} — {error}"));
                         }
@@ -381,8 +412,11 @@ impl TransportEngine {
                 RouteKind::CloudflareWorker | RouteKind::CloudflareProxy => 1,
                 RouteKind::TelegramIp | RouteKind::AlternateTelegramIp => 2,
                 RouteKind::SystemDns => 3,
-                // Last resort, raced separately; see race_connections().
-                RouteKind::TelegramTcp => 4,
+                // Last resort, raced separately; see race_connections(). The
+                // WebSocket goes first: its upgrade is an answer from Telegram,
+                // while TCP only shows that the address accepts connections.
+                RouteKind::TelegramPlainWs => 4,
+                RouteKind::TelegramTcp => 5,
             };
             (preferred_rank, kind_rank)
         });
@@ -481,10 +515,11 @@ pub(crate) fn cf_proxy_host(dc: u16, domain: &str) -> String {
     format!("kws{}.{}", dc, domain)
 }
 
-/// Native TCP to an ordinary data centre — every pinned address except the
-/// CDN, whose native transport is its primary route.
+/// Routes tried only once everything else failed: port 80, and native TCP to
+/// an ordinary data centre. The CDN's native TCP is its primary route.
 fn is_last_resort(route: &Route) -> bool {
-    route.kind == RouteKind::TelegramTcp && route.connect_host != CDN203_IP
+    route.kind == RouteKind::TelegramPlainWs
+        || (route.kind == RouteKind::TelegramTcp && route.connect_host != CDN203_IP)
 }
 
 /// Every address a Worker may be asked to reach, so a deployment can refuse
@@ -626,10 +661,11 @@ fn telegram_ips(dc: u16) -> &'static [&'static str] {
 pub fn routes_for_dc(dc: u16, media: bool) -> Vec<Route> {
     if dc == 203 {
         // CDN203 has no WebSocket frontend of its own: its address speaks only
-        // native obfuscated2, and kws2 on any frontend is plain DC2, where a
-        // CDN session has neither its keys nor its data. Worker and CF proxy
-        // routes are added on top in routes_for_key.
-        return vec![Route::cdn_tcp()];
+        // native obfuscated2 on 443, and kws2 on any frontend is plain DC2, where
+        // a CDN session has neither its keys nor its data. Port 80 of the same
+        // address does lead to the CDN. Worker and CF proxy routes are added on
+        // top in routes_for_key.
+        return vec![Route::cdn_tcp(), Route::plain_ws(CDN203_IP)];
     }
     let fronts = web_fronts(dc);
     if fronts.is_empty() {
@@ -666,9 +702,9 @@ pub fn routes_for_dc(dc: u16, media: bool) -> Vec<Route> {
             RouteKind::SystemDns,
         ));
     }
-    // Where the frontends are out of reach, native MTProto to the DC's own
-    // address may still work. Raced only after everything above failed
-    // (race_connections).
+    // Where the frontends are out of reach, the DC's own address may still
+    // work. Raced only after everything above failed (race_connections).
+    routes.push(Route::plain_ws(telegram_ips(dc)[0]));
     routes.push(Route::telegram_tcp(telegram_ips(dc)[0]));
     routes
 }
@@ -711,6 +747,11 @@ async fn connect_route_with_config(
             "native MTProto TCP разрешён только до закреплённых адресов Telegram".to_owned(),
         );
     }
+    if route.kind == RouteKind::TelegramPlainWs && !allowed_plain_ws_route(route) {
+        return Err(
+            "WebSocket без TLS разрешён только до закреплённых адресов Telegram".to_owned(),
+        );
+    }
     let tcp = tokio::time::timeout(
         CONNECT_TIMEOUT,
         TcpStream::connect((route.connect_host.as_str(), route.port)),
@@ -739,8 +780,8 @@ async fn connect_route_with_config(
     );
 
     if !route.secure {
-        // Raw TCP has already returned above. Plain WebSocket is only used by
-        // local fixtures; production WebSocket routes are always HTTPS.
+        // Raw TCP has already returned above. Besides local fixtures, plain
+        // WebSocket is only allowed to pinned Telegram addresses, checked above.
         return tokio::time::timeout(
             CONNECT_TIMEOUT,
             tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(tcp)),
@@ -764,6 +805,17 @@ async fn connect_route_with_config(
     .map_err(|_| "таймаут TLS/WebSocket".to_owned())?
     .map(|(websocket, _)| TelegramConnection::WebSocket(Box::new(websocket)))
     .map_err(|error| format!("TLS/WebSocket handshake: {}", error))
+}
+
+fn allowed_plain_ws_route(route: &Route) -> bool {
+    #[cfg(test)]
+    if route.connect_host == "127.0.0.1" {
+        return !route.secure;
+    }
+    worker_allowed_destinations().contains(&route.connect_host.as_str())
+        && route.port == HTTP_PORT
+        && route.websocket_host == route.connect_host
+        && !route.secure
 }
 
 fn allowed_tcp_route(route: &Route) -> bool {
@@ -849,7 +901,10 @@ mod tests {
         for dc in [1, 2, 3, 4, 5, 203] {
             for media in [false, true] {
                 for route in routes_for_dc(dc, media) {
-                    if route.kind == RouteKind::TelegramTcp || route.kind == RouteKind::SystemDns {
+                    if matches!(
+                        route.kind,
+                        RouteKind::TelegramTcp | RouteKind::TelegramPlainWs | RouteKind::SystemDns
+                    ) {
                         continue;
                     }
                     assert!(
@@ -893,7 +948,8 @@ mod tests {
         assert!(routes[0].websocket_host.is_empty());
         assert!(!routes[0].secure);
         assert_eq!(routes[0].connect_host, "91.105.192.100");
-        assert_eq!(routes.len(), 1, "CDN203 has no WebSocket frontend");
+        assert_eq!(routes[1], Route::plain_ws("91.105.192.100"));
+        assert_eq!(routes.len(), 2, "CDN203 has no WebSocket frontend on 443");
         assert!(routes
             .iter()
             .all(|route| route.connect_host == "91.105.192.100"));
@@ -975,15 +1031,27 @@ mod tests {
                 let routes = engine.routes_for_key(DcKey { dc, media });
                 assert!(!routes.is_empty(), "DC{dc} must have at least one route");
                 for route in routes {
-                    assert_eq!(route.port, 443, "{route:?}");
-                    if route.kind == RouteKind::TelegramTcp {
-                        assert!(
-                            telegram_ips(dc).contains(&route.connect_host.as_str()),
-                            "{route:?}"
-                        );
-                        assert!(allowed_tcp_route(&route));
-                    } else {
-                        assert!(route.secure, "{route:?}");
+                    match route.kind {
+                        RouteKind::TelegramTcp => {
+                            assert_eq!(route.port, 443, "{route:?}");
+                            assert!(
+                                telegram_ips(dc).contains(&route.connect_host.as_str()),
+                                "{route:?}"
+                            );
+                            assert!(allowed_tcp_route(&route));
+                        }
+                        // The only route without TLS: pinned address, and no
+                        // Telegram name on the wire.
+                        RouteKind::TelegramPlainWs => {
+                            assert_eq!(route.port, 80, "{route:?}");
+                            assert_eq!(route.connect_host, telegram_ips(dc)[0]);
+                            assert_eq!(route.websocket_host, route.connect_host);
+                            assert!(allowed_plain_ws_route(&route));
+                        }
+                        _ => {
+                            assert_eq!(route.port, 443, "{route:?}");
+                            assert!(route.secure, "{route:?}");
+                        }
                     }
                 }
             }
@@ -996,17 +1064,13 @@ mod tests {
         engine.set_cf_proxy_domains(&["example.com".to_owned()]);
         for dc in [1, 2, 3, 4, 5] {
             let ordered = engine.ordered_candidates(DcKey { dc, media: true });
-            let first_tcp = ordered
+            let first_fallback = ordered
                 .iter()
-                .position(|route| route.kind == RouteKind::TelegramTcp)
-                .expect("every DC has a native TCP fallback");
-            assert!(
-                ordered[first_tcp..].iter().all(is_last_resort),
-                "DC{dc}: {ordered:?}"
-            );
-            assert!(ordered[..first_tcp]
-                .iter()
-                .all(|route| !is_last_resort(route)));
+                .position(is_last_resort)
+                .expect("every DC has a last-resort route");
+            assert_eq!(ordered[first_fallback].kind, RouteKind::TelegramPlainWs);
+            assert_eq!(ordered[first_fallback + 1].kind, RouteKind::TelegramTcp);
+            assert_eq!(ordered.len(), first_fallback + 2, "DC{dc}: {ordered:?}");
         }
         let cdn = engine.ordered_candidates(DcKey {
             dc: 203,
@@ -1014,6 +1078,25 @@ mod tests {
         });
         assert_eq!(cdn[0], Route::cdn_tcp());
         assert!(!is_last_resort(&cdn[0]));
+        assert_eq!(cdn.last(), Some(&Route::plain_ws(CDN203_IP)));
+    }
+
+    #[tokio::test]
+    async fn plain_websocket_refuses_anything_but_a_pinned_address() {
+        for route in [
+            Route::plain_ws("203.0.113.5"),
+            Route {
+                websocket_host: "kws2.web.telegram.org".to_owned(),
+                ..Route::plain_ws("149.154.167.51")
+            },
+            Route {
+                port: 8080,
+                ..Route::plain_ws("149.154.167.51")
+            },
+        ] {
+            let error = connect_route(&route).await.unwrap_err();
+            assert!(error.contains("без TLS"), "{route:?}: {error}");
+        }
     }
 
     #[tokio::test]
@@ -1322,6 +1405,8 @@ mod tests {
             RouteKind::SystemDns,
             RouteKind::CloudflareWorker,
             RouteKind::TelegramTcp,
+            RouteKind::CloudflareProxy,
+            RouteKind::TelegramPlainWs,
         ] {
             assert_eq!(RouteKind::from_ui_code(kind.ui_code()), Some(kind));
             assert_eq!(route_label(kind.ui_code()), kind.label());
@@ -1627,6 +1712,20 @@ mod tests {
                 .iter()
                 .filter(|route| route.kind == RouteKind::TelegramTcp)
                 .all(|route| route.connect_host == telegram_ips(dc)[0]));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Telegram network access"]
+    async fn port_80_answers_on_every_native_address() {
+        for dc in [1, 2, 3, 4, 5, 203] {
+            let route = Route::plain_ws(telegram_ips(dc)[0]);
+            match connect_route(&route).await {
+                Ok(TelegramConnection::WebSocket(mut websocket)) => {
+                    websocket.close(None).await.unwrap()
+                }
+                other => panic!("DC{dc}: {other:?}"),
+            }
         }
     }
 

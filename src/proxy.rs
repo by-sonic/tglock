@@ -850,7 +850,7 @@ async fn ws_tunnel(
     let upstream = async {
         let mut crypto = upstream_crypto;
         // Worker пишет кадры в обычный TCP до Telegram, там они ничего не значат.
-        // Отдельный кадр на пакет нужен только WebSocket-фронту.
+        // Отдельный кадр на пакет нужен только WebSocket Telegram, на 443 и на 80.
         let mut splitter = (connected.route.kind != crate::transport::RouteKind::CloudflareWorker)
             .then(|| crate::mtproto::PacketSplitter::from_init(init));
         let mut buf = vec![0u8; 65536];
@@ -1851,6 +1851,7 @@ mod tests {
     async fn websocket_frontend_gets_one_packet_per_frame() {
         // Фронт разбирает один пакет на кадр, остальное застревает до следующего.
         check_packets_per_frame(crate::transport::RouteKind::TelegramIp, 2).await;
+        check_packets_per_frame(crate::transport::RouteKind::TelegramPlainWs, 2).await;
     }
 
     #[tokio::test]
