@@ -514,10 +514,11 @@ async function copyTelegramLink(): Promise<void> {
 }
 
 // Отчёт публикуют в issue: домен Worker'а и свой домен CF-прокси туда не идут,
-// а адреса и имена Telegram нужны, чтобы понять, какой маршрут не ответил.
+// Worker можно задать и адресом, поэтому оставляются только адреса Telegram.
+// Они и имена Telegram нужны, чтобы понять, какой маршрут не ответил.
 function publicLogLine(message: string): string {
   return message.replace(/[\w-]+(?:\.[\w-]+)+/g, (host) =>
-    /^[\d.]+$/.test(host) || host.endsWith(".telegram.org") ? host : "<домен>");
+    /^(149\.154|91\.105|91\.108)\.[\d.]+$/.test(host) || host.endsWith(".telegram.org") ? host : "<домен>");
 }
 
 function failureLog(): string[] {

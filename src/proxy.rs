@@ -772,7 +772,7 @@ async fn ws_tunnel(
     ws_w.send(tungstenite::Message::Binary(init.to_vec()))
         .await
         .map_err(|error| tunnel_route_error(stats, &connected, dc, &error.to_string()))?;
-    let carried_data = AtomicBool::new(false);
+    let health = TunnelHealth::new();
 
     // Ping приходит в половину, которая читает, а отвечать на него должна та,
     // которая пишет: владелец у отправляющей половины строго один.
@@ -790,7 +790,7 @@ async fn ws_tunnel(
             match message {
                 Ok(tungstenite::Message::Binary(mut data)) => {
                     if !data.is_empty() {
-                        carried_data.store(true, Ordering::Relaxed);
+                        health.note_reply();
                     }
                     if let Some(crypto) = &mut crypto {
                         crypto.apply(data.as_mut());
@@ -815,7 +815,7 @@ async fn ws_tunnel(
                             .is_ok_and(|code| code != 0)
                             || frame.code != tungstenite::protocol::frame::coding::CloseCode::Normal
                     });
-                    if !carried_data.load(Ordering::Relaxed) || transport_error {
+                    if !health.replied() || transport_error {
                         let reason = match frame {
                             Some(frame) => describe_ws_close(frame.code.into(), &frame.reason),
                             None => "WebSocket закрыт без ответа Telegram".to_owned(),
@@ -830,13 +830,13 @@ async fn ws_tunnel(
                         &connected,
                         dc,
                         &error.to_string(),
-                        &carried_data,
+                        &health,
                     ));
                 }
                 Ok(_) => {}
             }
         }
-        if !carried_data.load(Ordering::Relaxed) {
+        if !health.replied() {
             return Err(tunnel_route_error(
                 stats,
                 &connected,
@@ -865,6 +865,7 @@ async fn ws_tunnel(
                     }
                     Err(error) => return Err(error.into()),
                     Ok(read) => {
+                        health.note_request();
                         if let Some(crypto) = &mut crypto {
                             crypto.apply(&mut buf[..read]);
                         }
@@ -874,18 +875,18 @@ async fn ws_tunnel(
                         };
                         for packet in packets {
                             ws_w.feed(tungstenite::Message::Binary(packet)).await.map_err(|error| {
-                                tunnel_broke(stats, &connected, dc, &error.to_string(), &carried_data)
+                                tunnel_broke(stats, &connected, dc, &error.to_string(), &health)
                             })?;
                         }
                         ws_w.flush().await.map_err(|error| {
-                            tunnel_broke(stats, &connected, dc, &error.to_string(), &carried_data)
+                            tunnel_broke(stats, &connected, dc, &error.to_string(), &health)
                         })?;
                     }
                 },
                 payload = pong_rx.recv() => match payload {
                     Some(payload) => {
                         ws_w.send(tungstenite::Message::Pong(payload)).await.map_err(|error| {
-                            tunnel_broke(stats, &connected, dc, &error.to_string(), &carried_data)
+                            tunnel_broke(stats, &connected, dc, &error.to_string(), &health)
                         })?;
                     }
                     None => break,
@@ -893,6 +894,9 @@ async fn ws_tunnel(
             }
         }
         let _ = ws_w.close().await;
+        if health.went_silent() {
+            return Err(tunnel_route_error(stats, &connected, dc, SILENT_ROUTE));
+        }
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     };
 
@@ -926,32 +930,38 @@ async fn cdn_tcp_tunnel(
         Some((upstream, downstream)) => (Some(upstream), Some(downstream)),
         None => (None, None),
     };
-    let carried_data = AtomicBool::new(false);
+    let health = TunnelHealth::new();
     let upstream = async {
         let mut crypto = upstream_crypto;
         let mut buffer = vec![0; 65536];
         loop {
             let read = client_r.read(&mut buffer).await?;
             if read == 0 {
+                if health.went_silent() {
+                    return Err(tunnel_route_error(stats, connected, dc, SILENT_ROUTE));
+                }
                 return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
             }
+            health.note_request();
             if let Some(crypto) = &mut crypto {
                 crypto.apply(&mut buffer[..read]);
             }
-            remote_w.write_all(&buffer[..read]).await.map_err(|error| {
-                tunnel_broke(stats, connected, dc, &error.to_string(), &carried_data)
-            })?;
+            remote_w
+                .write_all(&buffer[..read])
+                .await
+                .map_err(|error| tunnel_broke(stats, connected, dc, &error.to_string(), &health))?;
         }
     };
     let downstream = async {
         let mut crypto = downstream_crypto;
         let mut buffer = vec![0; 65536];
         loop {
-            let read = remote_r.read(&mut buffer).await.map_err(|error| {
-                tunnel_broke(stats, connected, dc, &error.to_string(), &carried_data)
-            })?;
+            let read = remote_r
+                .read(&mut buffer)
+                .await
+                .map_err(|error| tunnel_broke(stats, connected, dc, &error.to_string(), &health))?;
             if read == 0 {
-                return if carried_data.load(Ordering::Relaxed) {
+                return if health.replied() {
                     Ok(())
                 } else {
                     Err(tunnel_route_error(
@@ -962,7 +972,7 @@ async fn cdn_tcp_tunnel(
                     ))
                 };
             }
-            carried_data.store(true, Ordering::Relaxed);
+            health.note_reply();
             if let Some(crypto) = &mut crypto {
                 crypto.apply(&mut buffer[..read]);
             }
@@ -1008,20 +1018,82 @@ fn tunnel_route_error(
     message.into()
 }
 
+const SILENT_ROUTE: &str = "Telegram не ответил на запрос, клиент ушёл сам";
+
+/// Сколько туннель должен проработать, чтобы его обрыв не считался поломкой
+/// маршрута. Один ответ ничего не доказывает: DPI режет и после первых байт.
+const PROVEN_TUNNEL: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(15)
+};
+
+/// Сколько Telegram может молчать в ответ на запрос. Он отвечает за доли секунды.
+const SILENT_TUNNEL: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(5)
+};
+
+/// Что туннель показал о своём маршруте.
+struct TunnelHealth {
+    opened: std::time::Instant,
+    requested: AtomicBool,
+    replied: AtomicBool,
+}
+
+impl TunnelHealth {
+    fn new() -> Self {
+        Self {
+            opened: std::time::Instant::now(),
+            requested: AtomicBool::new(false),
+            replied: AtomicBool::new(false),
+        }
+    }
+
+    fn note_request(&self) {
+        self.requested.store(true, Ordering::Relaxed);
+    }
+
+    fn note_reply(&self) {
+        self.replied.store(true, Ordering::Relaxed);
+    }
+
+    fn replied(&self) -> bool {
+        self.replied.load(Ordering::Relaxed)
+    }
+
+    /// Маршрут работал по-настоящему: Telegram отвечал, и не один миг.
+    fn proven(&self) -> bool {
+        self.replied() && self.opened.elapsed() >= PROVEN_TUNNEL
+    }
+
+    /// Клиент спросил, Telegram промолчал, и клиент сдался.
+    ///
+    /// Раньше такой маршрут оставался предпочтительным: TCP открылся, значит
+    /// успех, а отказа никто не зафиксировал. Запасные маршруты до очереди так
+    /// и не доходили. Быстрый уход не считается: клиент сам закрывает лишние
+    /// соединения из своей гонки.
+    fn went_silent(&self) -> bool {
+        self.requested.load(Ordering::Relaxed)
+            && !self.replied()
+            && self.opened.elapsed() >= SILENT_TUNNEL
+    }
+}
+
 /// Соединение оборвалось на полпути.
 ///
-/// Если Telegram успел ответить, маршрут рабочий: обрыв долгоживущего туннеля
-/// обычен, и пауза на маршруте оставила бы весь дата-центр без связи из-за него.
-/// Клиент сам откроет новое соединение. Маршрут наказывается, только если через
-/// него не прошло ни байта.
+/// Обрыв долгоживущего туннеля обычен, и пауза на рабочем маршруте оставила бы
+/// весь дата-центр без связи. Клиент сам откроет новое соединение. Маршрут
+/// наказывается, если он не успел доказать, что работает.
 fn tunnel_broke(
     stats: &Stats,
     connected: &crate::transport::ConnectedRoute,
     dc: u16,
     reason: &str,
-    carried_data: &AtomicBool,
+    health: &TunnelHealth,
 ) -> Box<dyn std::error::Error + Send + Sync> {
-    if !carried_data.load(Ordering::Relaxed) {
+    if !health.proven() {
         return tunnel_route_error(stats, connected, dc, reason);
     }
     let message = format!(
@@ -1859,18 +1931,16 @@ mod tests {
         check_packets_per_frame(crate::transport::RouteKind::CloudflareWorker, 1).await;
     }
 
-    #[tokio::test]
-    async fn a_tunnel_that_carried_data_does_not_penalize_its_route_when_it_breaks() {
-        // Иначе один обрыв рабочего туннеля ставил маршрут на паузу, и DC
-        // оставался без связи, а основное соединение уходило на чужой кластер.
+    /// Туннель, который ответил и через `lifetime` оборвался без закрывающего
+    /// кадра: так выглядит «Connection reset without closing handshake».
+    async fn break_tunnel_after(lifetime: Duration) -> Arc<Stats> {
         use futures_util::SinkExt;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay_port = listener.local_addr().unwrap().port();
         let relay = tokio::spawn(async move {
             let (mut ws, _) = accept_relay(listener).await;
             ws.send(Message::Binary(vec![1, 2, 3, 4])).await.unwrap();
-            // Сокет закрывается без закрывающего кадра: именно так выглядит
-            // «Connection reset without closing handshake» из журналов.
+            tokio::time::sleep(lifetime).await;
             drop(ws);
         });
         let stats = Stats::new();
@@ -1891,14 +1961,103 @@ mod tests {
             stats.active.load(Ordering::Relaxed) == 0
         })
         .await;
+        stats.stop();
+        server.await.unwrap().unwrap();
+        stats
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_that_proved_itself_does_not_penalize_its_route_when_it_breaks() {
+        // Иначе один обрыв рабочего туннеля ставил маршрут на паузу, и DC
+        // оставался без связи.
+        let stats = break_tunnel_after(PROVEN_TUNNEL + Duration::from_millis(100)).await;
         assert_eq!(stats.transport.route_failures(), 0);
         assert_eq!(stats.ws_failures.load(Ordering::Relaxed), 1);
         assert!(stats
             .drain_events()
             .iter()
             .any(|event| event.contains("Обрыв туннеля DC2")));
+    }
+
+    #[tokio::test]
+    async fn a_route_that_answers_once_and_dies_is_still_penalized() {
+        // Иначе он навсегда оставался бы предпочтительным: DPI режет и после
+        // первых байт, и запасные маршруты до очереди не доходили.
+        let stats = break_tunnel_after(Duration::ZERO).await;
+        assert_eq!(stats.transport.route_failures(), 1);
+        assert!(stats
+            .drain_events()
+            .iter()
+            .any(|event| event.contains("Сбой туннеля DC2")));
+    }
+
+    /// Telegram молчит, клиент спрашивает и уходит через `patience`.
+    async fn leave_silent_route_after(patience: Duration, raw_tcp: bool) -> Arc<Stats> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let relay = tokio::spawn(async move {
+            // Соединение держится открытым и без ответа, пока клиент не уйдёт.
+            if raw_tcp {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _ = done_rx.await;
+                drop(stream);
+            } else {
+                let (ws, _) = accept_relay(listener).await;
+                let _ = done_rx.await;
+                drop(ws);
+            }
+        });
+        let stats = Stats::new();
+        if raw_tcp {
+            stats.transport.force_local_route_with(
+                relay_port,
+                crate::transport::RouteKind::TelegramTcp,
+                String::new(),
+            );
+        } else {
+            stats.transport.force_local_route(relay_port);
+        }
+        let (port, server) = start_proxy(stats.clone(), false).await;
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let init = unambiguous_client_init(&stats.secret, if raw_tcp { 203 } else { 2 });
+        client.write_all(&init).await.unwrap();
+        client.write_all(&[0; 16]).await.unwrap();
+        tokio::time::sleep(patience).await;
+        drop(client);
+        wait_until("connection task finished", || {
+            stats.active.load(Ordering::Relaxed) == 0
+        })
+        .await;
+        let _ = done_tx.send(());
+        relay.await.unwrap();
         stats.stop();
         server.await.unwrap().unwrap();
+        stats
+    }
+
+    #[tokio::test]
+    async fn a_silent_route_is_penalized_when_the_client_gives_up() {
+        // Иначе CDN, который принял TCP и молчит, оставался первым в списке, и
+        // запасной маршрут через порт 80 не получал ни одного шанса.
+        for raw_tcp in [true, false] {
+            let wait = SILENT_TUNNEL + Duration::from_millis(100);
+            let stats = leave_silent_route_after(wait, raw_tcp).await;
+            assert_eq!(stats.transport.route_failures(), 1, "raw_tcp {raw_tcp}");
+            assert!(stats
+                .drain_events()
+                .iter()
+                .any(|event| event.contains(SILENT_ROUTE)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_leaves_at_once_does_not_penalize_the_route() {
+        // Клиент сам закрывает лишние соединения из своей гонки.
+        for raw_tcp in [true, false] {
+            let stats = leave_silent_route_after(Duration::ZERO, raw_tcp).await;
+            assert_eq!(stats.transport.route_failures(), 0, "raw_tcp {raw_tcp}");
+        }
     }
 
     #[tokio::test]

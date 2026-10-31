@@ -355,8 +355,10 @@ fn build_crypto_context(
 }
 
 /// Длина, больше которой пакет считается не настоящим. Файлы грузятся частями
-/// по 512 КиБ, и ждать целиком заведомо мусорный «пакет» нельзя.
-const MAX_PACKET: usize = 16 * 1024 * 1024;
+/// по 512 КиБ. Предел держит и память: в LAN-режиме чужое устройство могло бы
+/// заставить копить «пакет» на роутере. Если настоящий пакет окажется длиннее,
+/// поток просто пойдёт дальше без нарезки.
+const MAX_PACKET: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum Framing {
@@ -631,6 +633,23 @@ mod tests {
         let (mut splitter, wire) = splitter_for(INTERMEDIATE, &garbage);
         assert_eq!(splitter.push(&wire), vec![wire.clone()]);
         assert_eq!(splitter.push(b"more"), vec![b"more".to_vec()]);
+    }
+
+    #[test]
+    fn a_length_over_the_limit_is_never_buffered() {
+        let mut oversized = ((MAX_PACKET + 1) as u32).to_le_bytes().to_vec();
+        oversized.extend_from_slice(&[5; 32]);
+        let (mut splitter, wire) = splitter_for(INTERMEDIATE, &oversized);
+        assert_eq!(splitter.push(&wire), vec![wire.clone()]);
+        assert_eq!(splitter.finish(), None);
+    }
+
+    #[test]
+    fn the_largest_real_upload_part_still_arrives_whole() {
+        let packet = intermediate(&vec![7; 512 * 1024 + 256]);
+        let (mut splitter, wire) = splitter_for(INTERMEDIATE, &packet);
+        assert!(splitter.push(&wire[..65536]).is_empty());
+        assert_eq!(splitter.push(&wire[65536..]), vec![wire.clone()]);
     }
 
     #[test]
