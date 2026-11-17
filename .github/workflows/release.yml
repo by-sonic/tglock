@@ -49,7 +49,7 @@ jobs:
       matrix:
         include:
           - platform: macOS universal
-            os: macos-14
+            os: macos-latest
             args: --bundles app,dmg --target universal-apple-darwin
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
           - platform: Windows x64
@@ -174,7 +174,7 @@ jobs:
       matrix:
         include:
           - platform: macOS universal
-            os: macos-14
+            os: macos-latest
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
             asset: tglock-cli-universal-apple-darwin
           - platform: Windows x64
