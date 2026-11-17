@@ -730,6 +730,13 @@ impl Drop for EstablishedTunnel<'_> {
     }
 }
 
+/// Что делать, если провайдер не пускает к адресам Telegram совсем. В
+/// by-sonic/tglock#76 у Ростелекома отвечал только фронт DC2 и DC4, а до DC1,
+/// DC3 и DC5 не доходил ни один TCP-пакет; без Cloudflare туда дороги нет.
+const CLOUDFLARE_HINT: &str = "Если туннели не поднимаются постоянно, провайдер режет \
+     адреса Telegram. Обойти это можно через Cloudflare: свой домен (Настройки → Свой \
+     домен на Cloudflare, docs/CF_PROXY.md) или Cloudflare Worker (docs/CLOUDFLARE_WORKER.md)";
+
 async fn ws_tunnel(
     tcp: TcpStream,
     dc: u16,
@@ -748,6 +755,10 @@ async fn ws_tunnel(
             // причины, и отличить «провайдер режет адреса» от «воркер отвечает
             // отказом» было нечем (by-sonic/tglock#50).
             stats.note(error.clone());
+            if !stats.transport.has_cloudflare_routes() {
+                // Одна и та же строка попадает в журнал один раз.
+                stats.note(CLOUDFLARE_HINT);
+            }
             return Err(error.into());
         }
     };

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -16,6 +17,14 @@ const FALLBACK_DELAY: Duration = Duration::from_millis(250);
 const MAX_CONNECTING: usize = 3;
 const FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(30);
 const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+// Провайдер может молча отбрасывать часть соединений до адреса целиком: в
+// by-sonic/tglock#76 так терялось около трети соединений до единственного
+// доступного фронта Telegram. Повторы SYN такое соединение не спасают, а новое
+// соединение с другого порта проходит. Живое открывается за десятки
+// миллисекунд, поэтому следующая попытка начинается, если за полсекунды ответа
+// не было, и все они укладываются в CONNECT_TIMEOUT.
+const TCP_ATTEMPTS: usize = 3;
+const TCP_ATTEMPT_DELAY: Duration = Duration::from_millis(500);
 const HTTPS_PORT: u16 = 443;
 const HTTP_PORT: u16 = 80;
 const CDN203_IP: &str = "91.105.192.100";
@@ -286,23 +295,31 @@ impl TransportEngine {
             }
         }
 
+        // Все маршруты на паузе, и ни один не набирался. Пауза нужна, чтобы
+        // мёртвый адрес не задерживал живые; когда живых нет, она лишь
+        // гарантирует отказ. Telegram тут же переподключается, и в
+        // by-sonic/tglock#76 за четыре минуты набралось 17836 отказов при 160
+        // сбоях маршрутов: единственный рабочий фронт отдыхал после одного
+        // потерянного соединения. Поэтому один маршрут, чья пауза кончается
+        // раньше всех, пробуем всё равно. Остальные ждут своей паузы.
         if errors.is_empty() {
-            let routes = self.routes_for_key(key);
-            let health = self.health.lock().unwrap();
-            let retry = routes
-                .iter()
-                .filter_map(|route| health.routes.get(route))
-                .map(|entry| entry.retry_at.saturating_duration_since(Instant::now()))
-                .min();
-            errors.push(match retry {
-                Some(delay) => format!(
-                    "маршруты на паузе после ошибок; повтор через {} с",
-                    delay
-                        .as_secs()
-                        .saturating_add(u64::from(delay.subsec_nanos() != 0))
-                ),
-                None => "для этого дата-центра нет маршрутов".to_owned(),
-            });
+            if let Some(route) = self.soonest_paused_route(key) {
+                match connect(route.clone()).await {
+                    Ok(connection) => {
+                        self.record_success(key, &route);
+                        return Ok((connection, ConnectedRoute { route }));
+                    }
+                    Err(error) => {
+                        self.record_failure(&route);
+                        errors.push(format!("{} — {error}", describe_endpoint(&route)));
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            // Хоть один маршрут был бы набран выше, значит, их нет вовсе.
+            errors.push("для этого дата-центра нет маршрутов".to_owned());
         }
         Err(format!(
             "Не поднялся туннель до DC{}{}: {}",
@@ -353,19 +370,7 @@ impl TransportEngine {
                         }
                         Err(error) => {
                             self.record_failure(&route);
-                            let endpoint = match route.kind {
-                                RouteKind::TelegramTcp => {
-                                    format!("{}:{} (MTProto TCP)", route.connect_host, route.port)
-                                }
-                                RouteKind::TelegramPlainWs => {
-                                    format!("{}:{} (WebSocket)", route.connect_host, route.port)
-                                }
-                                _ => format!(
-                                    "{} (TLS {})",
-                                    route.connect_host, route.websocket_host
-                                ),
-                            };
-                            errors.push(format!("{endpoint} — {error}"));
+                            errors.push(format!("{} — {error}", describe_endpoint(&route)));
                         }
                     }
                 }
@@ -374,6 +379,25 @@ impl TransportEngine {
             }
         }
         None
+    }
+
+    /// Маршрут, чья пауза кончается раньше всех; последние средства — только
+    /// если ничего другого нет.
+    fn soonest_paused_route(&self, key: DcKey) -> Option<Route> {
+        let routes = self.routes_for_key(key);
+        let health = self.health.lock().unwrap();
+        routes.into_iter().min_by_key(|route| {
+            (
+                is_last_resort(route),
+                health.routes.get(route).map(|entry| entry.retry_at),
+            )
+        })
+    }
+
+    /// Задан ли хоть один маршрут через Cloudflare: Worker или свой домен.
+    pub fn has_cloudflare_routes(&self) -> bool {
+        !self.worker_domains.lock().unwrap().is_empty()
+            || !self.cf_proxy_domains.lock().unwrap().is_empty()
     }
 
     fn route_available(&self, route: &Route) -> bool {
@@ -495,6 +519,15 @@ impl TransportEngine {
                 retry_at: Instant::now() + delay,
             },
         );
+    }
+}
+
+/// Куда шёл маршрут — для журнала отказов.
+fn describe_endpoint(route: &Route) -> String {
+    match route.kind {
+        RouteKind::TelegramTcp => format!("{}:{} (MTProto TCP)", route.connect_host, route.port),
+        RouteKind::TelegramPlainWs => format!("{}:{} (WebSocket)", route.connect_host, route.port),
+        _ => format!("{} (TLS {})", route.connect_host, route.websocket_host),
     }
 }
 
@@ -754,7 +787,7 @@ async fn connect_route_with_config(
     }
     let tcp = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        TcpStream::connect((route.connect_host.as_str(), route.port)),
+        connect_tcp(route.connect_host.as_str(), route.port),
     )
     .await
     .map_err(|_| "не отвечает (таймаут TCP)".to_owned())?
@@ -805,6 +838,51 @@ async fn connect_route_with_config(
     .map_err(|_| "таймаут TLS/WebSocket".to_owned())?
     .map(|(websocket, _)| TelegramConnection::WebSocket(Box::new(websocket)))
     .map_err(|error| format!("TLS/WebSocket handshake: {}", error))
+}
+
+async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    hedged_connect(&addresses, TcpStream::connect).await
+}
+
+/// Открыть TCP, не полагаясь на одно соединение: см. `TCP_ATTEMPTS`.
+///
+/// Попытки идут внахлёст с шагом `TCP_ATTEMPT_DELAY` по адресам из DNS по
+/// кругу; побеждает первая открывшаяся, остальные закрываются. Отказ сразу
+/// (например, «соединение отвергнуто») запускает следующую попытку без ожидания.
+/// Время ограничивает вызывающий.
+async fn hedged_connect<T, F, Fut>(addresses: &[SocketAddr], mut connect: F) -> std::io::Result<T>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    if addresses.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "имя не разрешилось ни в один адрес",
+        ));
+    }
+    let mut pending = FuturesUnordered::new();
+    let mut started = 0;
+    let mut next_start = Instant::now();
+    let mut last_error = None;
+
+    while started < TCP_ATTEMPTS || !pending.is_empty() {
+        if started < TCP_ATTEMPTS && (pending.is_empty() || Instant::now() >= next_start) {
+            pending.push(connect(addresses[started % addresses.len()]));
+            started += 1;
+            next_start = Instant::now() + TCP_ATTEMPT_DELAY;
+            continue;
+        }
+        tokio::select! {
+            Some(result) = pending.next(), if !pending.is_empty() => match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last_error = Some(error),
+            },
+            _ = tokio::time::sleep_until(next_start), if started < TCP_ATTEMPTS => {}
+        }
+    }
+    Err(last_error.expect("at least one attempt was started and failed"))
 }
 
 fn allowed_plain_ws_route(route: &Route) -> bool {
@@ -1518,18 +1596,130 @@ mod tests {
         assert!(error.contains("test handshake failure"));
         assert_eq!(peak.load(Ordering::SeqCst), MAX_CONNECTING);
         assert_eq!(engine.route_failures(), 8);
+        // Every route is in cooldown now. Only one of them may be dialed per
+        // client: the cooldown still keeps the rest from being redialed.
+        let dialed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let error = engine
             .race_connections(key, |_| {
-                panic!("a route in cooldown must never be dialed");
-                #[allow(unreachable_code)]
-                std::future::ready(Ok::<(), String>(()))
+                dialed.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>("still down".to_owned()))
             })
             .await
             .unwrap_err();
-        assert!(error.contains("повтор через"));
-        assert_eq!(engine.route_failures(), 8);
+        assert!(error.contains("still down"));
+        assert_eq!(dialed.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.route_failures(), 9);
         tokio::time::advance(FAILURE_BACKOFF_INITIAL).await;
-        assert_eq!(engine.ordered_candidates(key).len(), 8);
+        assert_eq!(engine.ordered_candidates(key).len(), 7);
+    }
+
+    /// by-sonic/tglock#76: the provider dropped about a third of the TCP
+    /// connections to the only reachable frontend. One dropped connection put
+    /// that route in cooldown, and from then on every client failed at once
+    /// without dialing anything: 17836 failures against 160 route failures in
+    /// four minutes. With every route paused, the one whose pause ends first
+    /// must still be tried, and its success must lift the pause.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_only_route_is_still_tried_and_recovers() {
+        let engine = TransportEngine::new();
+        *engine.forced_routes.lock().unwrap() = local_routes(2);
+        let key = DcKey {
+            dc: 2,
+            media: false,
+        };
+        engine.record_failure(&local_routes(2)[1]);
+        engine.record_failure(&local_routes(2)[1]);
+        engine.record_failure(&local_routes(2)[0]);
+        assert!(engine.ordered_candidates(key).is_empty());
+
+        let (_, winner) = engine
+            .race_connections(key, |route| {
+                assert_eq!(
+                    route.path, "/0",
+                    "the route paused for the shortest time goes first"
+                );
+                std::future::ready(Ok::<(), String>(()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(winner.route.path, "/0");
+        assert_eq!(
+            engine.ordered_candidates(key),
+            vec![local_routes(2)[0].clone()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_tcp_connection_is_overtaken_by_the_next_attempt() {
+        let address: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Instant::now();
+        let winner = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            hedged_connect(&[address], |dialed| {
+                assert_eq!(dialed, address);
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        // The provider dropped this one: no answer, ever.
+                        std::future::pending::<std::io::Result<usize>>().await
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok(attempt)
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("a second connection must overtake the dropped one")
+        .unwrap();
+        assert_eq!(winner, 1);
+        assert_eq!(
+            started.elapsed(),
+            TCP_ATTEMPT_DELAY + Duration::from_millis(50)
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_attempts_are_bounded_and_spread_over_addresses() {
+        let addresses: Vec<SocketAddr> = vec![
+            "192.0.2.1:443".parse().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap(),
+        ];
+        let dialed = Arc::new(Mutex::new(Vec::new()));
+        let result = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            hedged_connect(&addresses, |address| {
+                dialed.lock().unwrap().push(address);
+                std::future::pending::<std::io::Result<()>>()
+            }),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "nothing answered, so the caller's timeout ends it"
+        );
+        assert_eq!(
+            *dialed.lock().unwrap(),
+            vec![addresses[0], addresses[1], addresses[0]]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refused_tcp_attempts_report_the_last_error() {
+        let address: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let error = hedged_connect(&[address], |_| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Err::<(), _>(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            )))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(attempts.load(Ordering::SeqCst), TCP_ATTEMPTS);
     }
 
     #[test]
