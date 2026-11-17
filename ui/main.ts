@@ -523,9 +523,8 @@ function publicLogLine(message: string): string {
 
 function failureLog(): string[] {
   const failure = /^(Не поднялся туннель|Сбой туннеля|Обрыв туннеля)/;
-  const paused = /на паузе после ошибок/;
   return status.logs
-    .filter(({ message }) => failure.test(message) && !paused.test(message))
+    .filter(({ message }) => failure.test(message))
     .slice(-20)
     .map(({ timestamp, message }) => `${timestamp} ${publicLogLine(message)}`);
 }
@@ -535,7 +534,7 @@ async function copyDiagnostics(): Promise<void> {
     // Public reports exclude proxy links and secrets.
     const report = {
       application: "TGLock",
-      version: "2.0.0-beta.19",
+      version: "2.0.0-beta.20",
       running: status.running,
       activeConnections: status.activeConnections,
       tunnels: status.tunnels,
