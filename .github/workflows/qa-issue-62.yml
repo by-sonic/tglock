@@ -7,7 +7,7 @@ permissions:
 jobs:
   desktop:
     name: Manjaro X11 / published releases
-    if: ${{ !contains(github.event.head_commit.message, '[transport only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[transport only]') && !contains(github.event.head_commit.message, '[editor only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -39,7 +39,7 @@ jobs:
           retention-days: 30
   worker:
     name: Worker, CLI protocol and signed media/ordinary DC
-    if: ${{ !contains(github.event.head_commit.message, '[transport only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[transport only]') && !contains(github.event.head_commit.message, '[editor only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -78,6 +78,7 @@ jobs:
           test "$success" -gt 0
   real-worker:
     name: Real Cloudflare workerd and Telegram CDN
+    if: ${{ !contains(github.event.head_commit.message, '[editor only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -91,6 +92,7 @@ jobs:
       - run: bash qa/transport.sh
   lan:
     name: Isolated LAN client through published beta.22
+    if: ${{ !contains(github.event.head_commit.message, '[editor only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -103,3 +105,31 @@ jobs:
       - run: bash qa/lan.sh
         env:
           GH_TOKEN: ${{ github.token }}
+  worker-editor:
+    name: Cloudflare Worker editor diagnostics before and after
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: |
+          temp="$RUNNER_TEMP/editor"
+          mkdir "$temp"
+          npm install --prefix "$temp" --no-audit --no-fund --silent typescript@5.9.3 @cloudflare/workers-types@5.20261024.1
+          for n in before after; do
+            ref=3aa6f413a30ed5896307f56ae66a6e243c952843^
+            [ "$n" = before ] || ref=v2.0.0-beta.22
+            git show "${ref}:worker/tglock-worker.js" > "$temp/$n.js"
+          done
+          cd "$temp"
+          check() { ./node_modules/.bin/tsc --allowJs --checkJs --noEmit --skipLibCheck --lib es2022 --target es2022 --module esnext --moduleResolution bundler --types @cloudflare/workers-types "$1.js"; }
+          check before > before-errors || true
+          cat before-errors
+          test "$(grep -c 'error TS' before-errors)" = 4
+          check after
+          echo "Published beta.22 Worker: zero TypeScript diagnostics"
