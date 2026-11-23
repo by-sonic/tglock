@@ -7,6 +7,7 @@ permissions:
 jobs:
   desktop:
     name: Manjaro X11 / published releases
+    if: ${{ !contains(github.event.head_commit.message, '[transport only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -38,6 +39,7 @@ jobs:
           retention-days: 30
   worker:
     name: Worker, CLI protocol and signed media/ordinary DC
+    if: ${{ !contains(github.event.head_commit.message, '[transport only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -74,3 +76,30 @@ jobs:
           done
           echo "Completed exchanges: $success/5"
           test "$success" -gt 0
+  real-worker:
+    name: Real Cloudflare workerd and Telegram CDN
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bash qa/transport.sh
+  lan:
+    name: Isolated LAN client through published beta.22
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: bash qa/lan.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
