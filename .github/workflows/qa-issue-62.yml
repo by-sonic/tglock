@@ -1,0 +1,76 @@
+name: Published AppImage and transport verification
+on:
+  push:
+    branches: [qa/tglock-issues-20261122]
+permissions:
+  contents: read
+jobs:
+  desktop:
+    name: Manjaro X11 / published releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download and verify released artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p images evidence
+          for n in 15 21 22; do
+            tag="v2.0.0-beta.$n"; file="TGLock_2.0.0-beta.${n}_amd64.AppImage"
+            gh release download "$tag" -p "$file" -D images
+            digest=$(gh release view "$tag" --json assets --jq ".assets[] | select(.name==\"$file\") | .digest")
+            echo "${digest#sha256:}  images/$file" | sha256sum --check
+          done
+      - name: Build Manjaro test environment
+        run: docker build --pull --tag tglock-manjaro -f qa/manjaro.Dockerfile qa
+      - name: Exercise original and current AppImages
+        run: |
+          chmod 777 evidence
+          docker run --rm --shm-size=1gb --network none -v "$PWD/images:/images:ro" -v "$PWD/evidence:/evidence" tglock-manjaro
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Manjaro-X11-render-evidence
+          path: evidence/
+          retention-days: 30
+  worker:
+    name: Worker, CLI protocol and signed media/ordinary DC
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Worker binary/Blob forwarding and diagnostics
+        run: npm run test:worker
+      - name: Verify published CLI and run protocol exchanges
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cli=tglock-cli-x86_64-unknown-linux-gnu
+          gh release download v2.0.0-beta.22 -p "$cli"
+          digest=$(gh release view v2.0.0-beta.22 --json assets --jq ".assets[]|select(.name==\"$cli\")|.digest")
+          echo "${digest#sha256:}  $cli" | sha256sum --check
+          chmod +x "$cli"; "./$cli" --version
+          secret="$RUNNER_TEMP/tglock-qa.secret"
+          umask 077
+          "./$cli" --bind 127.0.0.1 --port 18327 --secret-file "$secret" > "$RUNNER_TEMP/tglock-private.log" 2>&1 & child=$!
+          trap 'kill "$child" 2>/dev/null || true' EXIT
+          for i in {1..50}; do [ -s "$secret" ] && break; sleep .1; done
+          node scripts/probe_proxy.mjs --self-test
+          success=0
+          for dc in 2 -2 4 -4 203; do
+            if node scripts/probe_proxy.mjs --port 18327 --secret-file "$secret" --batched --dc "$dc" --timeout-ms 18000; then
+              echo "DC $dc exchange passed"; success=$((success+1))
+            else
+              echo "DC $dc exchange failed"
+            fi
+          done
+          echo "Completed exchanges: $success/5"
+          test "$success" -gt 0
